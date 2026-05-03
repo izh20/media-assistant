@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Models (too large for git)
+models/
+02-media-assistant/bundled/
+
+# Build artifacts
+02-media-assistant/dist/
+02-media-assistant/build/
+02-media-assistant/backend/
+02-media-assistant/Media-Assistant-*.dmg
+02-media-assistant/electron/node_modules/
+node_modules/
+
+# Data
+qdrant_storage/
+02-media-assistant/uploads/
+02-media-assistant/output/
+02-media-assistant/frames/
+
+# macOS
+.DS_Store
+._*
+.AppleDouble
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# Misc
+*.log
+package-lock.json

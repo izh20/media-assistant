@@ -1,0 +1,110 @@
+{
+  "name": "media-assistant",
+  "version": "1.0.0",
+  "description": "Media Assistant - 视频语音翻译字幕桌面应用",
+  "main": "main.js",
+  "author": "Media Assistant",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "build:mac": "electron-builder --mac --arm64",
+    "build:win": "electron-builder --win --x64"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.0"
+  },
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^26.8.1"
+  },
+  "build": {
+    "appId": "com.media-assistant.desktop",
+    "productName": "Media Assistant",
+    "copyright": "Copyright © 2026",
+    "electronDist": "./node_modules/electron/dist",
+    "directories": {
+      "output": "../dist"
+    },
+    "files": [
+      "**/*",
+      "!node_modules/.cache"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist/media-assistant/",
+        "to": "backend/",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../bundled/llama-server/",
+        "to": "bundled/llama-server/",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../bundled/models/",
+        "to": "bundled/models/",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "publish": {
+      "provider": "github",
+      "owner": "media-assistant",
+      "repo": "media-assistant",
+      "releaseType": "release"
+    },
+    "mac": {
+      "category": "public.app-category.video",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.icns",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
+    },
+    "dmg": {
+      "title": "Media Assistant",
+      "artifactName": "Media-Assistant-${version}-mac-arm64.dmg",
+      "contents": [
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "Media-Assistant-${version}-win-x64-setup.exe"
+    }
+  }
+}
