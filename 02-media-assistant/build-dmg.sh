@@ -35,9 +35,13 @@ VERSION="1.0.0"
 DMG_NAME="Media-Assistant-${VERSION}-mac-arm64.dmg"
 DMG_OUTPUT="${PROJECT_DIR}/${DMG_NAME}"
 
-# npm 镜像（国内加速）
-export ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/"
-NPM_REGISTRY="https://registry.npmmirror.com"
+# npm/electron 下载源（可通过环境变量覆盖）
+export ELECTRON_MIRROR="${ELECTRON_MIRROR:-https://cdn.npmmirror.com/binaries/electron/}"
+NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmjs.org}"
+
+if [ "${BUILD_KEEP_PROXY:-0}" != "1" ]; then
+    unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+fi
 
 info "============================================"
 info "  Media Assistant DMG 打包"
@@ -55,12 +59,8 @@ info "[0/7] 检查前提条件..."
 [ -f "${PROJECT_DIR}/bundled/models/faster-whisper-large-v3-turbo/model.bin" ] || error "bundled/models/faster-whisper-large-v3-turbo/model.bin 不存在"
 
 # 检查 LLM 模型
-TEXT_MODEL="${MODELS_DIR}/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_0.gguf"
-VISION_MODEL="${MODELS_DIR}/Qwen2-VL-7B-Instruct-GGUF/Qwen2-VL-7B-Instruct-Q4_K_M.gguf"
-MMPROJ_MODEL="${MODELS_DIR}/Qwen2-VL-7B-Instruct-GGUF/mmproj-Qwen2-VL-7B-Instruct-f16.gguf"
+TEXT_MODEL="${MODELS_DIR}/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_k_m.gguf"
 [ -f "${TEXT_MODEL}" ] || error "文本模型不存在: ${TEXT_MODEL}"
-[ -f "${VISION_MODEL}" ] || error "视觉模型不存在: ${VISION_MODEL}"
-[ -f "${MMPROJ_MODEL}" ] || error "MMProj 模型不存在: ${MMPROJ_MODEL}"
 
 command -v npm >/dev/null 2>&1 || error "npm 未安装"
 command -v node >/dev/null 2>&1 || error "node 未安装"
@@ -118,9 +118,7 @@ pkg['build']['extraResources'] = [
     {'from': '${PROJECT_DIR}/bundled/llama-server/', 'to': 'bundled/llama-server/', 'filter': ['**/*']},
     {'from': '${PROJECT_DIR}/bundled/ffmpeg/', 'to': 'bundled/ffmpeg/', 'filter': ['**/*']},
     {'from': '${PROJECT_DIR}/bundled/models/faster-whisper-large-v3-turbo/', 'to': 'bundled/models/faster-whisper-large-v3-turbo/', 'filter': ['**/*']},
-    {'from': '${TEXT_MODEL}', 'to': 'bundled/models/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_0.gguf'},
-    {'from': '${VISION_MODEL}', 'to': 'bundled/models/Qwen2-VL-7B-Instruct-GGUF/Qwen2-VL-7B-Instruct-Q4_K_M.gguf'},
-    {'from': '${MMPROJ_MODEL}', 'to': 'bundled/models/Qwen2-VL-7B-Instruct-GGUF/mmproj-Qwen2-VL-7B-Instruct-f16.gguf'}
+    {'from': '${TEXT_MODEL}', 'to': 'bundled/models/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_k_m.gguf'}
 ]
 pkg['build']['directories']['output'] = '${DIST_DIR}'
 json.dump(pkg, open('package.json','w'), indent=2)
@@ -174,9 +172,7 @@ CHECKS=(
     "${RESOURCES}/bundled/ffmpeg/mac-arm64/ffmpeg"
     "${RESOURCES}/bundled/ffmpeg/mac-arm64/ffprobe"
     "${RESOURCES}/bundled/models/faster-whisper-large-v3-turbo/model.bin"
-    "${RESOURCES}/bundled/models/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_0.gguf"
-    "${RESOURCES}/bundled/models/Qwen2-VL-7B-Instruct-GGUF/Qwen2-VL-7B-Instruct-Q4_K_M.gguf"
-    "${RESOURCES}/bundled/models/Qwen2-VL-7B-Instruct-GGUF/mmproj-Qwen2-VL-7B-Instruct-f16.gguf"
+    "${RESOURCES}/bundled/models/Qwen2.5-7B-Instruct-GGUF/qwen2.5-7b-instruct-q4_k_m.gguf"
 )
 FAIL=0
 for f in "${CHECKS[@]}"; do
@@ -208,7 +204,7 @@ fi
 hdiutil create \
     -volname "Media Assistant" \
     -srcfolder "${APP_PATH}" \
-    -ov -format UDRO \
+    -ov -format UDZO \
     "${DMG_OUTPUT}" 2>&1 | grep -E "created:|error|fail" || true
 
 [ -f "${DMG_OUTPUT}" ] || error "DMG 创建失败"

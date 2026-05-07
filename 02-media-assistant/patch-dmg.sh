@@ -27,10 +27,20 @@ DMG_NAME="Media-Assistant-${VERSION}-mac-arm64.dmg"
 DMG_OUTPUT="${PROJECT_DIR}/${DMG_NAME}"
 MOUNT_POINT="/tmp/media-patch-mount"
 WORK_DIR="/tmp/media-patch-app"
+APP_VOLUME="/Volumes/Media Assistant"
 
 info "============================================"
 info "  Media Assistant DMG 快速补丁"
 info "============================================"
+
+# 旧 DMG 仍被挂载或应用仍从镜像运行时，hdiutil attach 会报“资源忙”
+if [ -d "${APP_VOLUME}" ]; then
+    warn "检测到已挂载的 Media Assistant 卷，尝试释放占用..."
+    pkill -f "${APP_VOLUME}/Media Assistant.app" 2>/dev/null || true
+    sleep 2
+    hdiutil detach "${APP_VOLUME}" -force -quiet 2>/dev/null || true
+    sleep 1
+fi
 
 # 检查现有 DMG
 [ -f "${DMG_OUTPUT}" ] || error "找不到现有 DMG: ${DMG_OUTPUT}\n请先运行 build-dmg.sh 全量构建"
@@ -69,6 +79,7 @@ hdiutil detach "${MOUNT_POINT}" -quiet 2>/dev/null
 
 APP_PATH="${WORK_DIR}/Media Assistant.app"
 BACKEND_DIR="${APP_PATH}/Contents/Resources/backend"
+MODELS_DIR="${APP_PATH}/Contents/Resources/bundled/models"
 
 [ -d "${BACKEND_DIR}" ] || error ".app 中找不到 backend 目录"
 
@@ -76,6 +87,9 @@ BACKEND_DIR="${APP_PATH}/Contents/Resources/backend"
 info "  替换 backend..."
 rm -rf "${BACKEND_DIR}"
 cp -R "${PROJECT_DIR}/dist/media-assistant" "${BACKEND_DIR}/"
+
+info "  清理已移除的视觉模型资源..."
+rm -rf "${MODELS_DIR}/Qwen2-VL-7B-Instruct-GGUF"
 
 info "后端替换完成 ✓"
 
@@ -130,7 +144,7 @@ rm -f "${DMG_OUTPUT}"
 hdiutil create \
     -volname "Media Assistant" \
     -srcfolder "${APP_PATH}" \
-    -ov -format UDRO \
+    -ov -format UDZO \
     "${DMG_OUTPUT}" 2>&1 | grep -E "created:|error|fail" || true
 
 [ -f "${DMG_OUTPUT}" ] || error "DMG 创建失败"

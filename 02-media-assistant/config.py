@@ -8,6 +8,7 @@ MediaAssistant 配置管理模块
 import os
 import json
 import shutil
+import platform
 
 
 def get_config_dir():
@@ -52,14 +53,12 @@ DEFAULT_CONFIG = {
         "chat_path": "/chat/completions",
         "api_key": "",
         "model": "",
-        "timeout": 180
-    },
-    "vision": {
-        "endpoint_url": "http://127.0.0.1:8080/v1/chat/completions",
+        "model_path": "",
         "timeout": 180
     },
     "whisper": {
         "model_path": "bundled",
+        "backend": "faster-whisper",
         "device": "auto",
         "compute_type": "auto"
     },
@@ -72,12 +71,30 @@ DEFAULT_CONFIG = {
 }
 
 
+def _migrate_config(user_config):
+    """迁移旧配置，移除已废弃的视觉模型字段"""
+    if "vision" in user_config:
+        user_config.pop("vision")
+
+    llm = user_config.setdefault("llm", {})
+    model_path = llm.get("model_path", "")
+    if isinstance(model_path, str) and "qwen2-vl" in model_path.lower():
+        llm["model_path"] = ""
+    llm.pop("mmproj_path", None)
+
+    whisper = user_config.setdefault("whisper", {})
+    whisper["backend"] = "faster-whisper"
+    whisper.pop("mlx_model", None)
+    return user_config
+
+
 def load_config():
     """加载配置，合并默认值"""
     config_path = os.path.join(get_config_dir(), 'config.json')
     if os.path.exists(config_path):
         with open(config_path, 'r', encoding='utf-8') as f:
             user_config = json.load(f)
+        user_config = _migrate_config(user_config)
         merged = {}
         for key in DEFAULT_CONFIG:
             if isinstance(DEFAULT_CONFIG[key], dict):
@@ -101,13 +118,6 @@ def build_llm_url(config=None):
         config = load_config()
     llm = config["llm"]
     return llm["api_base"].rstrip("/") + "/" + llm["chat_path"].lstrip("/")
-
-
-def get_vision_url(config=None):
-    """获取 Vision endpoint URL"""
-    if config is None:
-        config = load_config()
-    return config["vision"]["endpoint_url"]
 
 
 def get_llm_api_key(config=None):
@@ -188,6 +198,11 @@ def get_whisper_model_path():
     if os.path.exists(model_path):
         return model_path
     return model_path  # 可能是 HuggingFace model ID
+
+
+def get_whisper_backend():
+    """Whisper 后端已固定为 faster-whisper。"""
+    return "faster-whisper"
 
 
 def get_whisper_device_config():

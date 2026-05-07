@@ -7,7 +7,7 @@
 
 ## 功能概述
 
-- **Web 应用**: 视频语音识别 + 多语言翻译 + 字幕导出 (端口 8090)
+- **Web 应用**: 视频语音识别 + 多语言翻译 + 字幕导出 + 字幕摘要 (端口 8090)
 - 视频/音频转录为文字 (命令行)
 - 转录文本语义搜索
 - 视频内容片段定位
@@ -21,7 +21,7 @@
     ↓ FFmpeg (-ar 16000 -ac 1 mono WAV)
 音频轨道
     ↓ 分块 (每块 10 分钟，控制内存)
-    ↓ faster-whisper (small, CPU, int8, VAD)
+    ↓ faster-whisper
 文字转录
     ↓ llama-server (Qwen2.5-7B, 端口 8080)
 翻译文本
@@ -49,8 +49,8 @@ SRT 字幕 (原文 / 译文 / 双语)
 |------|------|------|
 | Python | 3.11+ | via Homebrew |
 | FFmpeg | 最新版 | 音频提取 |
-| faster-whisper | 最新版 | 语音识别 (在 .venv 中) |
-| llama-server | - | 翻译 LLM (Qwen2.5-7B-Instruct, 端口 8080) |
+| faster-whisper | 最新版 | 语音识别 |
+| llama-server | - | 翻译与字幕总结 LLM (Qwen2.5-7B-Instruct, 端口 8080) |
 | Qdrant | 运行中 | 127.0.0.1:6333 (语义搜索用) |
 
 ## 安装依赖
@@ -130,13 +130,6 @@ python3 search_transcripts.py search <查询> [top_k]
 python3 search_transcripts.py search "有关AI的内容" 5
 ```
 
-## 硬件分工
-
-| 设备 | 任务 |
-|------|------|
-| **Mac Mini M4** | 转录 + Qdrant 向量库 |
-| **4070 Ti S** | 视频帧理解 (LLaVA/Qwen2-VL) - 待实现 |
-
 ## Whisper 模型选择
 
 | 模型 | 参数量 | 速度 | 精度 | 推荐场景 |
@@ -147,7 +140,71 @@ python3 search_transcripts.py search "有关AI的内容" 5
 | medium | 769M | 慢 | 较高 | 高精度需求 |
 | large | 1550M | 最慢 | 最高 | 最高精度 |
 
-当前配置: `small` (在 CPU + int8 模式下运行)
+当前配置:
+- Whisper 统一使用 `faster-whisper`
+- 默认优先使用内置 bundled 模型
+- 运行设备自动选择 `cpu/int8` 或 `cuda/float16`
+
+离线打包时会直接包含 bundled 的 faster-whisper 模型，随后执行：
+
+```bash
+bash build-dmg.sh
+```
+
+或者在已有 DMG 基础上增量同步：
+
+```bash
+bash patch-dmg.sh
+```
+
+### 快速验证（不生成 DMG）
+
+大多数代码修改不需要立刻重新打包 DMG，可以先跑本地 smoke test：
+
+```bash
+cd /Volumes/扩展盘512G/claude/project01/02-media-assistant
+bash quick-validate.sh
+```
+
+这个脚本会检查：
+
+- Python 语法是否通过
+- 模型选择接口 `/api/model_options` 是否可用
+- 运行日志接口 `/api/runtime_log` 是否可用
+- Whisper / LLM 候选是否能被发现
+- 当前 HTML 设置面板里是否包含模型选择控件
+
+如果要进一步做本地端到端验证，但仍然不生成 DMG，可以直接跑：
+
+```bash
+cd /Volumes/扩展盘512G/claude/project01/02-media-assistant
+bash smoke-web.sh
+```
+
+这个脚本会：
+
+- 先执行 `quick-validate.sh`
+- 在本地临时启动 Web 服务，默认使用端口 `18090`
+- 自动探测首页、`/api/model_options`、`/api/check_services`、`/api/runtime_log`
+- 如果失败，直接打印服务日志尾部，方便定位问题
+- 脚本结束后会自动停止这个临时服务，因此它不会持续占用 `8090`
+
+如果需要进一步手动点界面验证，而不想生成 DMG：
+
+```bash
+cd /Volumes/扩展盘512G/claude/project01/02-media-assistant
+.venv/bin/python video_subtitle_app.py
+```
+
+然后直接打开：
+
+- http://127.0.0.1:8090
+
+只有在准备分发给别的机器测试时，才需要执行：
+
+```bash
+bash patch-dmg.sh
+```
 
 ## 端口占用
 
@@ -170,7 +227,7 @@ python3 search_transcripts.py search "有关AI的内容" 5
 ├── media_info.py             # 媒体信息查看
 ├── uploads/                  # 上传的视频文件 (自动管理)
 ├── output/                   # 临时音频文件 + 字幕输出
-├── frames/                   # 视频帧提取 (待实现)
+├── frames/                   # 历史目录，当前主流程不再使用图像识别
 └── .venv/                    # Python 虚拟环境
 ```
 
@@ -256,7 +313,7 @@ curl -s http://127.0.0.1:8080/v1/models
 
 # 启动 llama-server
 cd /Volumes/扩展盘512G/claude/project01
-./startup.sh llama qwen2.5-7b-instruct-q4_0.gguf 8080
+./startup.sh llama qwen2.5-7b-instruct-q4_k_m.gguf 8080
 ```
 
 ### 3. 转录很慢或卡住

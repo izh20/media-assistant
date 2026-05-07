@@ -22,21 +22,24 @@ for _proxy_key in ("ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy", "HTTPS_
 import json
 import subprocess
 import re
+import traceback
 import uuid
 import time
 import asyncio
+from datetime import datetime
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from config import (
     load_config, save_config, get_port, get_data_dir, get_bundled_dir,
-    build_llm_url, get_vision_url, get_llm_api_key, get_llm_model,
-    find_ffmpeg, find_ffprobe, get_whisper_model_path, get_whisper_device_config,
+    build_llm_url, get_llm_api_key, get_llm_model,
+    find_ffmpeg, find_ffprobe, get_whisper_model_path,
+    get_whisper_backend, get_whisper_device_config,
 )
-from llm_manager import get_llm_manager, MODE_TEXT, MODE_VISION
+from llm_manager import get_llm_manager
 
 app = FastAPI(title="视频语音翻译字幕")
 
@@ -51,7 +54,6 @@ app.add_middleware(
 # 配置
 _cfg = load_config()
 LLM_URL = build_llm_url(_cfg)
-VISION_URL = get_vision_url(_cfg)
 FRAME_INTERVAL = _cfg["app"].get("frame_interval", 60)
 FFMPEG = find_ffmpeg()
 FFPROBE = find_ffprobe()
@@ -64,13 +66,16 @@ else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(_BASE_DIR, "uploads")
 OUTPUT_DIR = os.path.join(_BASE_DIR, "output")
-FRAME_DIR = os.path.join(_BASE_DIR, "frames")
 MAX_STORAGE_MB = 80 * 1024  # 上传+输出目录最大占用 80GB，超过后自动清理最旧的任务
 MAX_TASK_COUNT = 20        # 最多保留最近 20 个任务的文件
+TRANSLATE_BATCH_SIZE = 8
+TRANSLATE_BULK_MAX_ITEMS = 80
+TRANSLATE_BULK_MAX_CHARS = 6000
+MINIMAX_BULK_MAX_ITEMS = 80
+MINIMAX_BULK_MAX_CHARS = 6000
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(FRAME_DIR, exist_ok=True)
 
 # 支持的语言
 LANGUAGES = {
@@ -130,6 +135,8 @@ HTML_PAGE = """
         .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #555; }
         .status-dot.green { background: #4caf50; box-shadow: 0 0 6px #4caf50; }
         .status-dot.red { background: #f44336; }
+        .status-dot.yellow { background: #ffc107; box-shadow: 0 0 6px #ffc107; }
+        .status-dot.orange { background: #ff9800; }
         .upload-area {
             border: 2px dashed rgba(102,126,234,0.4);
             border-radius: 12px;
@@ -258,8 +265,6 @@ HTML_PAGE = """
             background: transparent; color: #aaa; cursor: pointer; font-size: 0.85em;
         }
         .preview-tab.active { background: rgba(102,126,234,0.2); border-color: #667eea; color: #eee; }
-        .frame-gallery { margin-top: 16px; }
-        .frame-gallery h4 { color: #bbb; margin-bottom: 12px; font-size: 1em; }
         .frame-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; margin-bottom: 16px; }
         .frame-card {
             background: rgba(0,0,0,0.3); border-radius: 10px; overflow: hidden;
@@ -282,7 +287,7 @@ HTML_PAGE = """
         .summary-box hr { border: none; border-top: 1px solid #444; margin: 12px 0; }
         .summary-box p { margin: 6px 0; }
         .summary-box ul, .summary-box ol { padding-left: 20px; margin: 6px 0; }
-        .preview-box.markdown { white-space: normal; }
+        .preview-box.markdown { white-space: pre-wrap; }
         .preview-box.markdown h1, .preview-box.markdown h2, .preview-box.markdown h3 { color: #ddd; margin: 12px 0 8px 0; }
         .preview-box.markdown h1 { font-size: 1.3em; border-bottom: 1px solid #444; padding-bottom: 6px; }
         .preview-box.markdown h2 { font-size: 1.15em; border-bottom: 1px solid #333; padding-bottom: 4px; }
@@ -290,6 +295,11 @@ HTML_PAGE = """
         .preview-box.markdown hr { border: none; border-top: 1px solid #444; margin: 12px 0; }
         .preview-box.markdown p { margin: 6px 0; }
         .preview-box.markdown ul, .preview-box.markdown ol { padding-left: 20px; margin: 6px 0; }
+        .preview-box.markdown blockquote {
+            margin: 8px 0; padding: 8px 12px;
+            border-left: 3px solid rgba(102,126,234,0.6);
+            background: rgba(255,255,255,0.04); color: #ddd;
+        }
         .frame-toggle { display: flex; align-items: center; gap: 10px; margin-bottom: 20px; }
         .frame-toggle label { color: #aaa; font-size: 0.9em; cursor: pointer; }
         .frame-toggle input[type="checkbox"] { width: 18px; height: 18px; cursor: pointer; accent-color: #667eea; }
@@ -340,17 +350,31 @@ HTML_PAGE = """
                     <label style="color:#aaa;font-size:12px">LLM Model (可选)</label>
                     <input type="text" id="cfg-llm-model" style="width:100%;padding:6px;background:#2a2a2a;border:1px solid #444;border-radius:4px;color:#eee" placeholder="留空使用服务默认模型">
                 </div>
-                <div style="grid-column:1/-1">
-                    <label style="color:#aaa;font-size:12px">Vision Endpoint URL</label>
-                    <input type="text" id="cfg-vision-url" style="width:100%;padding:6px;background:#2a2a2a;border:1px solid #444;border-radius:4px;color:#eee" placeholder="http://127.0.0.1:8080/v1/chat/completions">
+                <div>
+                    <label style="color:#aaa;font-size:12px">Whisper 模型</label>
+                    <select id="cfg-whisper-model-path" style="width:100%;padding:6px;background:#2a2a2a;border:1px solid #444;border-radius:4px;color:#eee"></select>
+                </div>
+                <div>
+                    <label style="color:#aaa;font-size:12px">本地 LLM 模型文件</label>
+                    <select id="cfg-llm-model-path" style="width:100%;padding:6px;background:#2a2a2a;border:1px solid #444;border-radius:4px;color:#eee"></select>
+                </div>
+                <div style="grid-column:1/-1;color:#888;font-size:12px;line-height:1.5">
+                    本地模式下，以上下拉框控制实际加载的 Whisper 与 LLM 模型。外部 API 模式下，LLM Model 作为请求模型名使用。
                 </div>
                 <div>
                     <label style="color:#aaa;font-size:12px">帧提取间隔 (秒)</label>
                     <input type="number" id="cfg-frame-interval" style="width:100%;padding:6px;background:#2a2a2a;border:1px solid #444;border-radius:4px;color:#eee" placeholder="60" min="10" max="600">
                 </div>
-                <div style="display:flex;align-items:end">
+                <div style="display:flex;align-items:end;gap:8px;flex-wrap:wrap">
+                    <button onclick="loadModelOptions()" style="padding:8px 14px;background:#2f3542;border:1px solid #555;border-radius:4px;color:#eee;cursor:pointer">刷新模型列表</button>
+                    <button onclick="refreshRuntimeLog()" style="padding:8px 14px;background:#2f3542;border:1px solid #555;border-radius:4px;color:#eee;cursor:pointer">刷新日志</button>
                     <button onclick="saveSettings()" style="padding:8px 20px;background:#667eea;border:none;border-radius:4px;color:#fff;cursor:pointer">保存设置</button>
                     <span id="settings-msg" style="margin-left:10px;color:#4caf50;font-size:12px"></span>
+                </div>
+                <div style="grid-column:1/-1">
+                    <label style="color:#aaa;font-size:12px">运行日志</label>
+                    <div style="color:#777;font-size:11px;margin:4px 0 8px 0">日志文件: /tmp/llm-logs/video_subtitle.log</div>
+                    <pre id="runtime-log" style="margin:0;min-height:180px;max-height:260px;overflow:auto;padding:12px;background:#111;border:1px solid #333;border-radius:6px;color:#cfd8dc;font-size:12px;line-height:1.45;white-space:pre-wrap">日志加载中...</pre>
                 </div>
             </div>
         </div>
@@ -363,11 +387,10 @@ HTML_PAGE = """
             <div class="service-item">
                 <span class="status-dot" id="dot-llm"></span>
                 <span>LLM 翻译服务 <span id="text-llm">检测中</span></span>
+                <button id="btn-llm-prewarm" onclick="llmPrewarm()" style="margin-left:12px;padding:2px 10px;font-size:11px;border-radius:4px;border:1px solid #555;background:#333;color:#ccc;cursor:pointer;display:none">预热模型</button>
+                <button id="btn-llm-release" onclick="llmRelease()" style="margin-left:6px;padding:2px 10px;font-size:11px;border-radius:4px;border:1px solid #555;background:#333;color:#ccc;cursor:pointer;display:none">释放模型</button>
             </div>
-            <div class="service-item">
-                <span class="status-dot" id="dot-vision"></span>
-                <span>视觉模型 (共用:8080) <span id="text-vision">检测中</span></span>
-            </div>
+
         </div>
 
         <div class="card task-history" id="task-history" style="display:none">
@@ -376,45 +399,13 @@ HTML_PAGE = """
         </div>
 
         <div class="card">
-            <h3>输入方式</h3>
-            <div class="mode-row">
-                <div class="mode-option active" id="input-local" onclick="setInputMode('local')">
-                    <div class="mode-icon">📁</div>
-                    <div class="mode-label">本地路径</div>
-                    <div class="mode-desc">直接输入文件路径，无需上传</div>
-                </div>
-                <div class="mode-option" id="input-upload" onclick="setInputMode('upload')">
-                    <div class="mode-icon">📤</div>
-                    <div class="mode-label">上传文件</div>
-                    <div class="mode-desc">从浏览器上传文件到服务器</div>
-                </div>
-            </div>
-
-            <div id="local-path-area">
-                <div class="lang-group" style="margin-bottom:20px">
-                    <label>文件路径</label>
-                    <input type="text" id="local-path" placeholder="输入视频/音频文件的完整路径，如 /path/to/video.mp4"
-                        style="width:100%;padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.08);color:#eee;font-size:0.95em;"
-                        oninput="onPathInput()">
-                    <div style="color:#777;font-size:0.8em;margin-top:4px">支持 MP4, MKV, AVI, MOV, WMV, WebM, MP3, WAV 等格式</div>
-                </div>
-            </div>
-
-            <div id="upload-file-area" style="display:none">
-                <div class="upload-area" id="upload-area">
-                    <div class="upload-icon">🎬</div>
-                    <div class="upload-text">点击或拖拽上传视频/音频文件</div>
-                    <div class="upload-hint">支持 MP4, MKV, AVI, MOV, WMV, WebM, MP3, WAV 等格式 (最大 50GB)</div>
-                    <input type="file" id="file-input" accept="video/*,audio/*,.mp4,.mkv,.avi,.mov,.webm,.flv,.wmv,.mp3,.wav,.m4a,.flac,.ogg">
-                </div>
-
-                <div class="file-info" id="file-info">
-                    <div class="file-meta">
-                        <div class="file-name" id="file-name"></div>
-                        <div class="file-size" id="file-size"></div>
-                    </div>
-                    <button class="remove-btn" onclick="removeFile()">移除</button>
-                </div>
+            <h3>输入文件路径</h3>
+            <div class="lang-group" style="margin-bottom:20px">
+                <label>文件路径</label>
+                <input type="text" id="local-path" placeholder="输入视频/音频文件的完整路径，如 /path/to/video.mp4"
+                    style="width:100%;padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.08);color:#eee;font-size:0.95em;"
+                    oninput="onPathInput()">
+                <div style="color:#777;font-size:0.8em;margin-top:4px">支持 MP4, MKV, AVI, MOV, WMV, WebM, MP3, WAV 等格式</div>
             </div>
 
             <h3>处理模式</h3>
@@ -466,18 +457,13 @@ HTML_PAGE = """
                 </div>
             </div>
 
-            <div class="frame-toggle">
-                <input type="checkbox" id="enable-frames" checked>
-                <label for="enable-frames">启用视频帧分析（与翻译共用 :8080，需多模态模型）</label>
-            </div>
-
             <button class="btn" id="start-btn" onclick="startProcess()" disabled>开始处理</button>
 
             <div class="progress-area" id="progress-area">
                 <div class="step pending" id="step-upload">
                     <div class="step-icon">1</div>
                     <div class="step-text">
-                        <div class="step-title">上传文件</div><div class="step-status">等待中</div>
+                        <div class="step-title">校验文件</div><div class="step-status">等待中</div>
                         <div class="step-progress"><div class="progress-track"><div class="progress-fill"></div></div><div class="progress-pct">0%</div></div>
                     </div>
                 </div>
@@ -509,13 +495,6 @@ HTML_PAGE = """
                         <div class="step-progress"><div class="progress-track"><div class="progress-fill"></div></div><div class="progress-pct">0%</div></div>
                     </div>
                 </div>
-                <div class="step pending" id="step-frames" style="display:none">
-                    <div class="step-icon">6</div>
-                    <div class="step-text">
-                        <div class="step-title">视频帧分析</div><div class="step-status">等待中</div>
-                        <div class="step-progress"><div class="progress-track"><div class="progress-fill"></div></div><div class="progress-pct">0%</div></div>
-                    </div>
-                </div>
             </div>
 
             <div class="result-area" id="result-area">
@@ -525,55 +504,70 @@ HTML_PAGE = """
                     <div class="preview-tabs" id="preview-tabs"></div>
                     <div class="preview-box" id="preview-box"></div>
                 </div>
-                <div class="frame-gallery" id="frame-gallery" style="display:none">
-                    <h4>📸 视频帧分析</h4>
-                    <div id="video-summary"></div>
-                    <div class="frame-grid" id="frame-grid"></div>
-                </div>
             </div>
         </div>
     </div>
 
     <script>
-        let selectedFile = null;
         let taskId = null;
         let currentMode = 'translate';
-        let inputMode = 'local';
         let previewData = {};
         let progressTimer = null;
 
+        let _isExternalApi = false;
         async function checkServices() {
             try {
                 const res = await fetch('/api/check_services');
                 const data = await res.json();
-                setDot('whisper', data.whisper);
-                setDot('llm', data.llm);
-                setDot('vision', data.vision);
-                if (!data.vision) {
-                    document.getElementById('enable-frames').checked = false;
+                _isExternalApi = !!data.external_api;
+                setDot('whisper', data.whisper, data.whisper_detail || '', data.whisper_text || '');
+                setDot('llm', data.llm, data.llm_detail || '', data.llm_text || '', data.external_conflict);
+                // 按钮可见性
+                const btnPre = document.getElementById('btn-llm-prewarm');
+                const btnRel = document.getElementById('btn-llm-release');
+                if (_isExternalApi) {
+                    btnPre.style.display = 'none';
+                    btnRel.style.display = 'none';
+                } else {
+                    btnPre.style.display = data.llm ? 'none' : 'inline-block';
+                    btnRel.style.display = data.llm ? 'inline-block' : 'none';
+                    if (data.external_conflict) { btnPre.style.display = 'none'; btnRel.style.display = 'none'; }
                 }
-            } catch { setDot('whisper', false); setDot('llm', false); setDot('vision', false); }
+            } catch {
+                setDot('whisper', false, 'check-failed');
+                setDot('llm', false, 'check-failed');
+            }
         }
-        function setDot(n, ok) {
-            document.getElementById('dot-'+n).className = 'status-dot '+(ok?'green':'red');
-            document.getElementById('text-'+n).textContent = ok?'就绪':'离线';
+        function setDot(n, ok, detail='', label='', externalConflict=false) {
+            const dot = document.getElementById('dot-'+n);
+            const text = document.getElementById('text-'+n);
+            let color = ok ? 'green' : 'red';
+            if (n === 'llm' && !ok && !externalConflict && label && !label.includes('离线')) color = 'yellow';
+            if (n === 'llm' && externalConflict) color = 'orange';
+            dot.className = 'status-dot ' + color;
+            text.textContent = label || (ok ? '就绪' : '离线');
+            const title = detail ? ((ok ? '就绪' : '离线') + ': ' + detail) : (ok ? '就绪' : '离线');
+            dot.title = title;
+            text.title = title;
+        }
+        async function llmPrewarm() {
+            try {
+                const res = await fetch('/api/llm_start', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+                if (!res.ok) { const d = await res.json(); alert(d.error || '预热失败'); }
+            } catch(e) { alert('请求失败: ' + e); }
+            checkServices();
+        }
+        async function llmRelease() {
+            try {
+                const res = await fetch('/api/llm_stop', {method:'POST'});
+                if (!res.ok) { const d = await res.json(); alert(d.error || '释放失败'); }
+            } catch(e) { alert('请求失败: ' + e); }
+            checkServices();
         }
 
-        function setInputMode(mode) {
-            inputMode = mode;
-            document.getElementById('input-local').classList.toggle('active', mode==='local');
-            document.getElementById('input-upload').classList.toggle('active', mode==='upload');
-            document.getElementById('local-path-area').style.display = mode==='local'?'':'none';
-            document.getElementById('upload-file-area').style.display = mode==='upload'?'':'none';
-            updateStartBtn();
-        }
         function onPathInput() { updateStartBtn(); }
         function updateStartBtn() {
-            if (inputMode === 'local') {
-                document.getElementById('start-btn').disabled = !document.getElementById('local-path').value.trim();
-            } else {
-                document.getElementById('start-btn').disabled = !selectedFile;
-            }
+            document.getElementById('start-btn').disabled = !document.getElementById('local-path').value.trim();
         }
 
         function setMode(mode) {
@@ -584,35 +578,6 @@ HTML_PAGE = """
             document.getElementById('step-translate').style.display = mode==='translate'?'':'none';
         }
 
-        const uploadArea = document.getElementById('upload-area');
-        const fileInput = document.getElementById('file-input');
-        uploadArea.addEventListener('click', () => fileInput.click());
-        uploadArea.addEventListener('dragover', e => { e.preventDefault(); uploadArea.classList.add('dragover'); });
-        uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('dragover'));
-        uploadArea.addEventListener('drop', e => { e.preventDefault(); uploadArea.classList.remove('dragover'); handleFiles(e.dataTransfer.files); });
-        fileInput.addEventListener('change', () => handleFiles(fileInput.files));
-
-        function handleFiles(files) {
-            if (!files.length) return;
-            selectedFile = files[0];
-            document.getElementById('file-name').textContent = selectedFile.name;
-            document.getElementById('file-size').textContent = formatSize(selectedFile.size);
-            document.getElementById('file-info').classList.add('show');
-            document.getElementById('upload-area').style.display = 'none';
-            updateStartBtn();
-        }
-        function removeFile() {
-            selectedFile = null; fileInput.value = '';
-            document.getElementById('file-info').classList.remove('show');
-            document.getElementById('upload-area').style.display = '';
-            updateStartBtn();
-        }
-        function formatSize(b) {
-            if (b < 1024) return b+' B';
-            if (b < 1048576) return (b/1024).toFixed(1)+' KB';
-            if (b < 1073741824) return (b/1048576).toFixed(1)+' MB';
-            return (b/1073741824).toFixed(2)+' GB';
-        }
         function setStepProgress(stepId, percent, detail) {
             const step = document.getElementById(stepId);
             const prog = step.querySelector('.step-progress');
@@ -625,28 +590,13 @@ HTML_PAGE = """
             const el = document.getElementById(stepId);
             if (el) { const p = el.querySelector('.step-progress'); if (p) p.classList.remove('show'); }
         }
-        function uploadWithProgress(fd) {
-            return new Promise((resolve, reject) => {
-                const xhr = new XMLHttpRequest();
-                xhr.upload.onprogress = function(e) {
-                    if (e.lengthComputable) {
-                        const pct = Math.round(e.loaded / e.total * 100);
-                        setStepProgress('step-upload', pct, '上传中 '+formatSize(e.loaded)+' / '+formatSize(e.total));
-                    }
-                };
-                xhr.onload = function() { xhr.status===200 ? resolve(JSON.parse(xhr.responseText)) : reject(new Error('上传失败: HTTP '+xhr.status)); };
-                xhr.onerror = function() { reject(new Error('网络错误')); };
-                xhr.open('POST', '/api/upload');
-                xhr.send(fd);
-            });
-        }
         function startProgressPolling(tid) {
             stopProgressPolling();
             progressTimer = setInterval(async () => {
                 try {
                     const res = await fetch('/api/progress/'+tid);
                     const d = await res.json();
-                    const map = {audio:'step-audio', transcribe:'step-transcribe', translate:'step-translate', subtitle:'step-subtitle', frames:'step-frames'};
+                    const map = {audio:'step-audio', transcribe:'step-transcribe', translate:'step-translate', subtitle:'step-subtitle'};
                     const sid = map[d.step];
                     if (sid && d.percent !== undefined) setStepProgress(sid, d.percent, d.detail);
                 } catch {}
@@ -668,41 +618,22 @@ HTML_PAGE = """
             document.getElementById('progress-area').classList.add('show');
             document.getElementById('result-area').classList.remove('show');
             document.getElementById('preview-area').classList.remove('show');
-            ['step-upload','step-audio','step-transcribe','step-translate','step-subtitle','step-frames'].forEach(s => { setStep(s,'pending','等待中'); hideStepProgress(s); });
-            const enableFrames = document.getElementById('enable-frames').checked;
-            document.getElementById('step-frames').style.display = enableFrames ? '' : 'none';
+            ['step-upload','step-audio','step-transcribe','step-translate','step-subtitle'].forEach(s => { setStep(s,'pending','等待中'); hideStepProgress(s); });
 
             try {
-                if (inputMode === 'local') {
-                    setStep('step-upload','running','验证文件...');
-                    const localPath = document.getElementById('local-path').value.trim();
-                    const res = await fetch('/api/local_file', {
-                        method:'POST',
-                        headers:{'Content-Type':'application/json'},
-                        body: JSON.stringify({path: localPath, source_lang: srcLang, target_lang: tgtLang, mode: currentMode, enable_frames: enableFrames})
-                    });
-                    const data = await res.json();
-                    if (data.error) throw new Error(data.error);
-                    taskId = data.task_id;
-                    localStorage.setItem('active_task_id', taskId);
-                    localStorage.setItem('active_task_name', localPath.split('/').pop());
-                    setStep('step-upload','done', data.message);
-                } else {
-                    if (!selectedFile) return;
-                    setStep('step-upload','running','准备上传...');
-                    setStepProgress('step-upload', 0, '准备上传...');
-                    const fd = new FormData();
-                    fd.append('file', selectedFile);
-                    fd.append('source_lang', srcLang);
-                    fd.append('target_lang', tgtLang);
-                    fd.append('mode', currentMode);
-                    const upData = await uploadWithProgress(fd);
-                    if (upData.error) throw new Error(upData.error);
-                    taskId = upData.task_id;
-                    localStorage.setItem('active_task_id', taskId);
-                    localStorage.setItem('active_task_name', selectedFile.name);
-                    setStep('step-upload','done','上传完成');
-                }
+                setStep('step-upload','running','验证文件...');
+                const localPath = document.getElementById('local-path').value.trim();
+                const res = await fetch('/api/local_file', {
+                    method:'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({path: localPath, source_lang: srcLang, target_lang: tgtLang, mode: currentMode})
+                });
+                const data = await res.json();
+                if (data.error) throw new Error(data.error);
+                taskId = data.task_id;
+                localStorage.setItem('active_task_id', taskId);
+                localStorage.setItem('active_task_name', localPath.split('/').pop());
+                setStep('step-upload','done', data.message);
 
                 startProgressPolling(taskId);
 
@@ -735,25 +666,13 @@ HTML_PAGE = """
                 const subRes = await fetch('/api/process/'+taskId+'/subtitle', { method:'POST' });
                 const subData = await subRes.json();
                 if (subData.error) throw new Error(subData.error);
-                setStep('step-subtitle','done','完成');
-
-                if (enableFrames) {
-                    setStep('step-frames','running','视频帧分析...');
-                    setStepProgress('step-frames', 0, '提取关键帧...');
-                    const frRes = await fetch('/api/process/'+taskId+'/frames', { method:'POST' });
-                    const frData = await frRes.json();
-                    if (frData.error) {
-                        setStep('step-frames','error', frData.error);
-                    } else {
-                        setStep('step-frames','done', frData.message);
-                    }
-                }
+                setStep('step-subtitle','done', subData.message || '完成');
 
                 stopProgressPolling();
                 btn.textContent = '✅ 处理完成';
                 localStorage.removeItem('active_task_id');
                 localStorage.removeItem('active_task_name');
-                saveTaskToHistory(taskId, document.getElementById('local-path')?.value || (selectedFile?selectedFile.name:''));
+                saveTaskToHistory(taskId, document.getElementById('local-path')?.value || '');
                 showResults(taskId);
             } catch (e) {
                 stopProgressPolling();
@@ -789,42 +708,13 @@ HTML_PAGE = """
                     tabs.appendChild(tab);
                     if (first) {
                         const box = document.getElementById('preview-box');
-                        if (key === 'summary') {
-                            box.className = 'preview-box markdown';
-                            box.innerHTML = simpleMarkdown(previewData[key]);
-                        } else {
-                            box.textContent = previewData[key];
-                        }
+                        renderPreviewContent(key, previewData[key], box);
                         first = false;
                     }
                 }
                 document.getElementById('preview-area').classList.add('show');
             }
             document.getElementById('result-area').classList.add('show');
-
-            // 显示帧分析结果
-            try {
-                const frRes = await fetch('/api/frames/'+tid);
-                const frData = await frRes.json();
-                if (frData.frames && frData.frames.length > 0) {
-                    const gallery = document.getElementById('frame-gallery');
-                    const grid = document.getElementById('frame-grid');
-                    const summaryDiv = document.getElementById('video-summary');
-                    grid.innerHTML = '';
-                    if (frData.summary) {
-                        summaryDiv.innerHTML = '<div class="summary-box">'+simpleMarkdown(frData.summary)+'</div>';
-                    }
-                    for (const fr of frData.frames) {
-                        grid.innerHTML += '<div class="frame-card">' +
-                            '<img src="/api/frame_image/'+tid+'/'+fr.idx+'" loading="lazy">' +
-                            '<div class="frame-info">' +
-                            '<div class="frame-time">⏱ '+fr.time_str+'</div>' +
-                            '<div class="frame-desc">'+escapeHtml(fr.description||'')+'</div>' +
-                            '</div></div>';
-                    }
-                    gallery.style.display = '';
-                }
-            } catch {}
         }
 
         function escapeHtml(text) {
@@ -844,32 +734,89 @@ HTML_PAGE = """
             // bold / italic
             html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
             html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+            // blockquote
+            html = html.replace(/^> (.+)$/gm, '<blockquote>$1</blockquote>');
             // unordered list
-            html = html.replace(/^[\\-\\*] (.+)$/gm, '<li>$1</li>');
-            html = html.replace(/(<li>.*<\\/li>\\n?)+/g, m => '<ul>' + m + '</ul>');
+            html = html.replace(/^[-*] (.+)$/gm, '<li>$1</li>');
+            html = html.replace(/(<li>.*?<\/li>\s*)+/gs, m => '<ul>' + m + '</ul>');
             // ordered list
-            html = html.replace(/^\\d+[\\.\\)] (.+)$/gm, '<li>$1</li>');
+            html = html.replace(/^\d+[.)] (.+)$/gm, '<li>$1</li>');
             // paragraphs: double newline
             html = html.replace(/\\n{2,}/g, '</p><p>');
             html = '<p>' + html + '</p>';
             // clean up empty paragraphs around block elements
             html = html.replace(/<p>\s*(<h[123]|<hr|<ul|<\/ul|<ol|<\/ol)/g, '$1');
-            html = html.replace(/(<\/h[123]>|<hr>|<\/ul>|<\/ol>)\s*<\/p>/g, '$1');
+            html = html.replace(/<p>\s*(<blockquote>)/g, '$1');
+            html = html.replace(/(<\/h[123]>|<hr>|<\/ul>|<\/ol>|<\/blockquote>)\s*<\/p>/g, '$1');
             html = html.replace(/<p>\s*<\/p>/g, '');
             return html;
+        }
+
+        function formatSrtAsMarkdown(srtText, key) {
+            const titleMap = {
+                source: '原文字幕预览',
+                translated: '译文字幕预览',
+                bilingual: '双语字幕预览',
+            };
+            const blocks = (srtText || '').trim().split(/\\n\s*\\n/).filter(Boolean);
+            const sections = blocks.map((block, index) => {
+                const lines = block.split(/\\n/).map(line => line.trim()).filter(Boolean);
+                if (!lines.length) return '';
+                let cursor = 0;
+                let cueIndex = String(index + 1);
+                if (/^\d+$/.test(lines[cursor])) {
+                    cueIndex = lines[cursor];
+                    cursor += 1;
+                }
+                let timeLine = '未知';
+                if (cursor < lines.length && lines[cursor].includes('-->')) {
+                    timeLine = lines[cursor];
+                    cursor += 1;
+                }
+                const bodyLines = lines.slice(cursor);
+                const body = bodyLines.length
+                    ? bodyLines.map(line => `> ${line}`).join('\\n')
+                    : '> [该字幕段无文本]';
+                return `### 字幕 ${cueIndex}\n\n- 时间: ${timeLine}\n\n${body}`;
+            }).filter(Boolean);
+
+            if (!sections.length) {
+                return `# ${titleMap[key] || '字幕预览'}\n\n暂无可显示内容。`;
+            }
+
+            return `# ${titleMap[key] || '字幕预览'}\n\n${sections.join('\\n\\n---\\n\\n')}`;
+        }
+
+        function normalizePreviewText(text) {
+            const raw = String(text || '').replace(/\\r\\n/g, '\\n');
+            if (!raw.includes('\\n') && raw.includes('\\\\n')) {
+                return raw.replace(/\\\\r\\\\n/g, '\\n').replace(/\\\\n/g, '\\n');
+            }
+            return raw;
+        }
+
+        function renderPreviewContent(key, content, box) {
+            box.className = 'preview-box markdown';
+            const normalizedText = normalizePreviewText(content);
+            if (key === 'summary') {
+                box.innerHTML = simpleMarkdown(normalizedText);
+                return;
+            }
+
+            const rawText = normalizedText;
+            if (rawText.includes('-->')) {
+                box.innerHTML = simpleMarkdown(formatSrtAsMarkdown(rawText, key));
+                return;
+            }
+
+            box.innerHTML = simpleMarkdown(rawText);
         }
 
         function switchPreview(key, tab) {
             document.querySelectorAll('.preview-tab').forEach(t => t.classList.remove('active'));
             tab.classList.add('active');
             const box = document.getElementById('preview-box');
-            if (key === 'summary') {
-                box.className = 'preview-box markdown';
-                box.innerHTML = simpleMarkdown(previewData[key]||'');
-            } else {
-                box.className = 'preview-box';
-                box.textContent = previewData[key]||'';
-            }
+            renderPreviewContent(key, previewData[key], box);
         }
 
         function saveTaskToHistory(tid, fileName) {
@@ -931,7 +878,7 @@ HTML_PAGE = """
                 }
                 taskId = tid;
                 const btn = document.getElementById('start-btn');
-                const stepMap = {upload:'step-upload',audio:'step-audio',transcribe:'step-transcribe',translate:'step-translate',subtitle:'step-subtitle',frames:'step-frames'};
+                const stepMap = {upload:'step-upload',audio:'step-audio',transcribe:'step-transcribe',translate:'step-translate',subtitle:'step-subtitle'};
 
                 if (data.completed) {
                     btn.textContent = '✅ 处理完成'; btn.disabled = true;
@@ -998,16 +945,7 @@ HTML_PAGE = """
                     const r = await fetch('/api/process/'+tid+'/subtitle',{method:'POST'});
                     const d = await r.json();
                     if (d.error) throw new Error(d.error);
-                    setStep('step-subtitle','done','完成');
-                }
-                if (st.steps.frames && st.steps.frames!=='done' && st.steps.frames!=='skip') {
-                    document.getElementById('step-frames').style.display = '';
-                    setStep('step-frames','running','视频帧分析...');
-                    setStepProgress('step-frames',0,'提取关键帧...');
-                    const r = await fetch('/api/process/'+tid+'/frames',{method:'POST'});
-                    const d = await r.json();
-                    if (d.error) setStep('step-frames','error',d.error);
-                    else setStep('step-frames','done',d.message);
+                    setStep('step-subtitle','done', d.message || '完成');
                 }
                 stopProgressPolling();
                 btn.textContent = '✅ 处理完成';
@@ -1027,11 +965,55 @@ HTML_PAGE = """
 
         // ──── Settings ────
         const PRESETS = {
-            local: { api_base: 'http://127.0.0.1:8080/v1', chat_path: '/chat/completions', api_key: '', model: '', vision_url: 'http://127.0.0.1:8080/v1/chat/completions' },
-            minimax: { api_base: 'https://api.minimaxi.com/v1', chat_path: '/chat/completions', api_key: '', model: 'MiniMax-M2.5', vision_url: '' },
-            deepseek: { api_base: 'https://api.deepseek.com/v1', chat_path: '/chat/completions', api_key: '', model: 'deepseek-chat', vision_url: '' },
-            openai: { api_base: 'https://api.openai.com/v1', chat_path: '/chat/completions', api_key: '', model: 'gpt-4o-mini', vision_url: '' },
+            local: { api_base: 'http://127.0.0.1:8080/v1', chat_path: '/chat/completions', model: '' },
+            minimax: { api_base: 'https://api.minimaxi.com/v1', chat_path: '/chat/completions', model: 'MiniMax-M2.7' },
+            deepseek: { api_base: 'https://api.deepseek.com/v1', chat_path: '/chat/completions', model: 'deepseek-chat' },
+            openai: { api_base: 'https://api.openai.com/v1', chat_path: '/chat/completions', model: 'gpt-4o-mini' },
         };
+        function populateModelSelect(selectId, options, currentValue, currentMeta) {
+            const select = document.getElementById(selectId);
+            if (!select) return;
+            const normalizedCurrent = currentValue ?? '';
+            select.innerHTML = '';
+            let hasCurrent = normalizedCurrent === '';
+            for (const item of (options || [])) {
+                const opt = document.createElement('option');
+                opt.value = item.value ?? '';
+                opt.textContent = item.label || item.value || '未命名模型';
+                if (item.detail) opt.title = item.detail;
+                select.appendChild(opt);
+                if (opt.value === normalizedCurrent) {
+                    hasCurrent = true;
+                }
+            }
+            if (!hasCurrent && normalizedCurrent) {
+                const extra = document.createElement('option');
+                extra.value = normalizedCurrent;
+                extra.textContent = '当前配置: ' + normalizedCurrent.split('/').pop();
+                select.appendChild(extra);
+            }
+            select.value = normalizedCurrent;
+        }
+        async function loadModelOptions(cfg) {
+            try {
+                const r = await fetch('/api/model_options');
+                const data = await r.json();
+                const current = cfg || data.current || {};
+                populateModelSelect('cfg-whisper-model-path', data.whisper?.faster || [], current.whisper?.model_path ?? 'bundled');
+                populateModelSelect('cfg-llm-model-path', data.llm?.local || [], current.llm?.model_path ?? '');
+            } catch (e) {
+                console.error('loadModelOptions:', e);
+            }
+        }
+        async function refreshRuntimeLog() {
+            try {
+                const r = await fetch('/api/runtime_log?lines=200');
+                const text = await r.text();
+                document.getElementById('runtime-log').textContent = text || '暂无日志';
+            } catch (e) {
+                document.getElementById('runtime-log').textContent = '读取日志失败: ' + e.message;
+            }
+        }
         function highlightPreset() {
             const base = document.getElementById('cfg-llm-api-base').value.replace(/\/+$/, '');
             document.querySelectorAll('.preset-btn').forEach(b => {
@@ -1048,11 +1030,9 @@ HTML_PAGE = """
         function applyPreset(name) {
             const p = PRESETS[name];
             if (!p) return;
-            const oldKey = document.getElementById('cfg-llm-api-key').value;
             document.getElementById('cfg-llm-api-base').value = p.api_base;
             document.getElementById('cfg-llm-chat-path').value = p.chat_path;
             document.getElementById('cfg-llm-model').value = p.model;
-            if (p.vision_url) document.getElementById('cfg-vision-url').value = p.vision_url;
             // 切换到内置模型时清空 key，切换到外部时保留已有 key
             if (name === 'local') {
                 document.getElementById('cfg-llm-api-key').value = '';
@@ -1078,21 +1058,24 @@ HTML_PAGE = """
                 document.getElementById('cfg-llm-chat-path').value = cfg.llm?.chat_path || '';
                 document.getElementById('cfg-llm-api-key').value = cfg.llm?.api_key || '';
                 document.getElementById('cfg-llm-model').value = cfg.llm?.model || '';
-                document.getElementById('cfg-vision-url').value = cfg.vision?.endpoint_url || '';
                 document.getElementById('cfg-frame-interval').value = cfg.app?.frame_interval || 60;
+                await loadModelOptions(cfg);
+                await refreshRuntimeLog();
                 highlightPreset();
             } catch(e) { console.error('loadSettings:', e); }
         }
         async function saveSettings() {
+            const llmSelect = document.getElementById('cfg-llm-model-path');
             const body = {
                 llm: {
                     api_base: document.getElementById('cfg-llm-api-base').value,
                     chat_path: document.getElementById('cfg-llm-chat-path').value,
                     api_key: document.getElementById('cfg-llm-api-key').value,
                     model: document.getElementById('cfg-llm-model').value,
+                    model_path: llmSelect?.value || '',
                 },
-                vision: {
-                    endpoint_url: document.getElementById('cfg-vision-url').value,
+                whisper: {
+                    model_path: document.getElementById('cfg-whisper-model-path').value || 'bundled',
                 },
                 app: {
                     frame_interval: parseInt(document.getElementById('cfg-frame-interval').value) || 60,
@@ -1104,6 +1087,8 @@ HTML_PAGE = """
                 const msg = document.getElementById('settings-msg');
                 msg.textContent = '✓ ' + (data.message || '已保存');
                 setTimeout(() => msg.textContent = '', 3000);
+                await loadModelOptions(data.config);
+                await refreshRuntimeLog();
                 checkServices();
             } catch(e) { alert('保存失败: ' + e.message); }
         }
@@ -1120,6 +1105,179 @@ HTML_PAGE = """
 # ========== 任务管理 ==========
 tasks = {}
 _whisper_model = None  # Whisper 模型全局单例，避免重复加载
+_whisper_model_key = None
+_RUNTIME_LOG_DIR = Path('/tmp/llm-logs')
+_RUNTIME_LOG_FILE = _RUNTIME_LOG_DIR / 'video_subtitle.log'
+_SPLIT_GGUF_RE = re.compile(r'-\d{5}-of-\d{5}\.gguf$', re.IGNORECASE)
+
+
+def _append_runtime_log(tag, message):
+    try:
+        _RUNTIME_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with _RUNTIME_LOG_FILE.open('a', encoding='utf-8') as f:
+            f.write(f'[{timestamp}] [{tag}] {message}\n')
+    except Exception:
+        pass
+
+
+def _append_runtime_exception(tag, context, exc):
+    detail = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+    _append_runtime_log(tag, f"{context}\n{detail}")
+
+
+def _classify_whisper_model_source(model_path):
+    bundled_dir = get_bundled_dir()
+    if bundled_dir:
+        bundled_models_dir = os.path.join(bundled_dir, "models")
+        if model_path.startswith(bundled_models_dir):
+            return "内置模型"
+    if "/bundled/models/" in model_path:
+        return "内置模型"
+    if os.path.exists(model_path):
+        return "本地路径"
+    return "HuggingFace"
+
+
+def _display_model_name(model_value, empty_label="未指定模型"):
+    if not model_value:
+        return empty_label
+    model_value = str(model_value).strip()
+    if not model_value:
+        return empty_label
+    return os.path.basename(model_value.rstrip('/')) or model_value
+
+
+def _reset_whisper_runtime(reason):
+    global _whisper_model, _whisper_model_key
+    _whisper_model = None
+    _whisper_model_key = None
+    _append_runtime_log("Whisper", f"reset reason={reason}")
+
+
+def _iter_local_gguf_files(root_dir):
+    if not root_dir or not os.path.isdir(root_dir):
+        return
+    for current_root, dirnames, filenames in os.walk(root_dir):
+        dirnames[:] = [name for name in dirnames if not name.startswith('.')]
+        for filename in sorted(filenames):
+            if not filename.lower().endswith('.gguf'):
+                continue
+            if _SPLIT_GGUF_RE.search(filename):
+                continue
+            yield os.path.join(current_root, filename)
+
+
+def _append_option(options, seen, value, label, detail="", **extra):
+    if value in seen:
+        return
+    option = {"value": value, "label": label}
+    if detail:
+        option["detail"] = detail
+    for key, extra_value in extra.items():
+        if extra_value not in (None, ""):
+            option[key] = extra_value
+    options.append(option)
+    seen.add(value)
+
+
+def _get_bundled_models_dirs():
+    result = []
+    bundled = get_bundled_dir()
+    if bundled:
+        candidate = os.path.join(bundled, 'models')
+        if os.path.isdir(candidate):
+            result.append(candidate)
+    dev_candidate = os.path.join(os.path.dirname(__file__), 'bundled', 'models')
+    if os.path.isdir(dev_candidate):
+        result.append(dev_candidate)
+    return result
+
+
+def _discover_whisper_model_options():
+    faster = []
+    faster_seen = set()
+    resolved_faster = get_whisper_model_path()
+
+    _append_option(faster, faster_seen, 'bundled', '自动使用内置 faster-whisper 模型', detail=resolved_faster)
+    _append_option(faster, faster_seen, 'deepdml/faster-whisper-large-v3-turbo-ct2', 'HuggingFace: deepdml/faster-whisper-large-v3-turbo-ct2')
+
+    cfg = load_config()
+    faster_current = cfg.get('whisper', {}).get('model_path', 'bundled')
+    if faster_current and faster_current != 'bundled':
+        _append_option(faster, faster_seen, faster_current, f"当前配置: {_display_model_name(faster_current)}", detail=faster_current)
+
+    for models_dir in _get_bundled_models_dirs():
+        for entry in sorted(os.listdir(models_dir)):
+            path = os.path.join(models_dir, entry)
+            if not os.path.isdir(path):
+                continue
+            lower_name = entry.lower()
+            if 'whisper' not in lower_name or 'mlx' in lower_name:
+                continue
+            _append_option(faster, faster_seen, path, f"本地 faster-whisper: {entry}", detail=path)
+
+    return {'faster': faster}
+
+
+def _discover_local_model_options():
+    """扫描本地所有可用文本 GGUF 模型"""
+    mgr = get_llm_manager()
+    options = []
+    seen = set()
+    _append_option(options, seen, '', '自动选择默认模型')
+    cfg = load_config()
+    current = cfg.get('llm', {}).get('model_path', '')
+    if current and 'qwen2-vl' not in current.lower() and 'mmproj' not in current.lower():
+        _append_option(options, seen, current, f"当前配置: {_display_model_name(current)}", detail=current)
+
+    for path in _iter_local_gguf_files(mgr._model_dir):
+        filename = os.path.basename(path).lower()
+        if 'mmproj' in filename or 'embed' in filename or 'qwen2-vl' in filename:
+            continue
+        label = os.path.basename(path)
+        detail = os.path.relpath(path, mgr._model_dir)
+        _append_option(options, seen, path, label, detail=detail)
+    return options
+
+
+def _get_whisper_runtime_summary():
+    backend = get_whisper_backend()
+    model_path = get_whisper_model_path()
+    summary = {
+        "backend": backend,
+        "model_path": model_path,
+        "model_source": _classify_whisper_model_source(model_path),
+        "model_name": os.path.basename(model_path.rstrip('/')) or model_path,
+    }
+    device, compute_type = get_whisper_device_config()
+    summary["device"] = device
+    summary["compute_type"] = compute_type
+    return summary
+
+
+def _get_whisper_status_payload():
+    summary = _get_whisper_runtime_summary()
+    backend = summary["backend"]
+    model_source = summary["model_source"]
+    model_name = summary["model_name"]
+    label_backend = "faster-whisper"
+
+    device = summary["device"]
+    compute_type = summary["compute_type"]
+    try:
+        from faster_whisper import WhisperModel  # noqa: F401
+        return {
+            "ok": True,
+            "text": f"就绪 · {label_backend} · {model_source}",
+            "detail": f"backend=faster-whisper; source={model_source}; model={model_name}; device={device}; compute={compute_type}",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "text": f"离线 · {label_backend} · {model_source}",
+            "detail": f"backend=faster-whisper; source={model_source}; model={model_name}; device={device}; compute={compute_type}; error={type(exc).__name__}",
+        }
 
 
 def _dir_size_mb(path):
@@ -1171,21 +1329,57 @@ def _is_external_api():
     return not api_base.startswith("http://127.0.0.1:8080") and not api_base.startswith("http://localhost:8080")
 
 
-def _ensure_llm(mode=MODE_TEXT):
-    """确保 LLM 服务运行，返回是否就绪"""
+def _is_minimax_external_api(config=None):
+    """当前是否使用 MiniMax OpenAI 兼容外部接口。"""
+    if config is None:
+        config = load_config()
+    api_base = (config.get("llm", {}).get("api_base", "") or "").rstrip("/").lower()
+    model_name = (config.get("llm", {}).get("model", "") or "").strip().lower()
+    is_local = api_base.startswith("http://127.0.0.1:8080") or api_base.startswith("http://localhost:8080")
+    if is_local:
+        return False
+    return "minimaxi.com" in api_base or model_name.startswith("minimax-")
+
+
+def _resolve_translation_request_options(body):
+    """根据请求体和当前 provider 决定翻译策略默认值。"""
+    config = load_config()
+    use_minimax_bulk = _is_minimax_external_api(config)
+    strategy_value = (body.get("strategy") or "").strip().lower()
+    if strategy_value not in {"batch", "bulk"}:
+        strategy_value = "bulk" if use_minimax_bulk else "batch"
+
+    batch_size = _normalize_translation_limit(body.get("batch_size"), TRANSLATE_BATCH_SIZE, minimum=1, maximum=64)
+    max_items_default = MINIMAX_BULK_MAX_ITEMS if use_minimax_bulk else TRANSLATE_BULK_MAX_ITEMS
+    max_chars_default = MINIMAX_BULK_MAX_CHARS if use_minimax_bulk else TRANSLATE_BULK_MAX_CHARS
+    max_items = _normalize_translation_limit(body.get("max_items"), max_items_default, minimum=1, maximum=200)
+    max_chars = _normalize_translation_limit(body.get("max_chars"), max_chars_default, minimum=200, maximum=20000)
+    return strategy_value, batch_size, max_items, max_chars
+
+
+def _ensure_llm():
+    """确保 LLM 服务运行，返回是否就绪（推理入口专用：按需启动）"""
     # 外部 API 不需要启动本地 llama-server
     if _is_external_api():
         return True
     mgr = get_llm_manager()
-    if mgr.ensure_running(mode):
+    if mgr.ensure_running_for_inference():
         # 动态更新 URL 指向本地管理的服务
-        global LLM_URL, VISION_URL
-        if mode == MODE_TEXT:
-            LLM_URL = mgr.get_chat_url()
-        else:
-            VISION_URL = mgr.get_chat_url()
+        global LLM_URL
+        LLM_URL = mgr.get_chat_url()
         return True
     return False
+
+
+def _llm_inference_guard():
+    """推理计数守卫：在 _ensure_llm 之后调用，返回后在 finally 中释放"""
+    if not _is_external_api():
+        get_llm_manager().acquire_inference()
+
+def _llm_inference_done():
+    """推理结束释放计数"""
+    if not _is_external_api():
+        get_llm_manager().release_inference()
 
 
 def post_json(url, data, api_key=None, timeout=180):
@@ -1209,7 +1403,11 @@ def post_json(url, data, api_key=None, timeout=180):
             body = e.read().decode('utf-8')
         except Exception:
             pass
+        _append_runtime_log("HTTP", f"post-failed url={url} model={data.get('model', '') or 'default'} status={e.code} body={body[:1200]}")
         raise RuntimeError(f"HTTP {e.code}: {body[:300]}") from e
+    except Exception as exc:
+        _append_runtime_exception("HTTP", f"post-exception url={url} model={data.get('model', '') or 'default'}", exc)
+        raise
 
 
 def format_time(seconds):
@@ -1221,58 +1419,141 @@ def format_time(seconds):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def translate_batch(text_list, source_lang, target_lang, batch_size=8, task=None):
-    _ensure_llm(MODE_TEXT)
-    """使用 LLM 批量翻译文本"""
-    src_name = LANGUAGE_NAMES_EN.get(source_lang, source_lang)
-    tgt_name = LANGUAGE_NAMES_EN.get(target_lang, target_lang)
+def _normalize_translation_limit(value, default, minimum=1, maximum=None):
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        normalized = default
+    normalized = max(minimum, normalized)
+    if maximum is not None:
+        normalized = min(maximum, normalized)
+    return normalized
 
-    translations = []
-    total = len(text_list)
-    total_batches = max(1, (total + batch_size - 1) // batch_size)
 
-    for batch_idx, i in enumerate(range(0, total, batch_size)):
-        batch = text_list[i:i + batch_size]
-        numbered = "\n".join(f"{j + 1}. {t}" for j, t in enumerate(batch))
+def _build_translation_windows(text_list, batch_size, strategy, max_items, max_chars):
+    if strategy != "bulk":
+        return [text_list[i:i + batch_size] for i in range(0, len(text_list), batch_size)]
 
-        prompt = f"""Translate the following {src_name} subtitles into {tgt_name}. Keep it concise and natural for subtitles. Output only the translations, one per line, numbered.
+    windows = []
+    current = []
+    current_chars = 0
+    for text in text_list:
+        text = text or ""
+        estimated_chars = len(text) + 12
+        should_flush = current and (
+            len(current) >= max_items or current_chars + estimated_chars > max_chars
+        )
+        if should_flush:
+            windows.append(current)
+            current = []
+            current_chars = 0
+        current.append(text)
+        current_chars += estimated_chars
+
+    if current:
+        windows.append(current)
+    return windows
+
+
+def _build_translation_prompt(batch, src_name, tgt_name):
+    numbered = "\n".join(f"{j + 1}. {t}" for j, t in enumerate(batch))
+    return f"""Translate the following {src_name} subtitles into {tgt_name}. Keep it concise and natural for subtitles. Output only the translations, one per line, numbered.
 
 {len(batch)} subtitles:
 {numbered}
 
 {tgt_name} translations (numbered, one per line):"""
 
+
+def _estimate_translation_max_tokens(batch):
+    estimated_chars = sum(len(text or "") for text in batch)
+    estimated_tokens = int(estimated_chars * 1.6) + len(batch) * 24
+    return max(256, min(4096, estimated_tokens))
+
+
+def _request_translation_batch(batch, src_name, tgt_name):
+    prompt = _build_translation_prompt(batch, src_name, tgt_name)
+    req_data = {
+        "messages": [
+            {"role": "system", "content": f"You are a professional subtitle translator. Translate {src_name} to {tgt_name}. Be concise and natural."},
+            {"role": "user", "content": prompt}
+        ],
+        "stream": False,
+        "temperature": 0.3,
+        "max_tokens": _estimate_translation_max_tokens(batch),
+    }
+    model_name = get_llm_model()
+    if model_name:
+        req_data["model"] = model_name
+    result = post_json(LLM_URL, req_data, api_key=get_llm_api_key())
+    response = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+    response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+    lines = response.strip().split('\n')
+
+    parsed = []
+    for line in lines:
+        line = line.strip()
+        line = re.sub(r'^\d+[\.、\:\：\)）]?\s*', '', line)
+        if line:
+            parsed.append(line)
+
+    translations = []
+    for idx, text in enumerate(batch):
+        if idx < len(parsed):
+            translations.append(parsed[idx])
+        else:
+            translations.append(f"[翻译失败] {text}")
+    return translations
+
+
+def translate_batch(text_list, source_lang, target_lang, batch_size=TRANSLATE_BATCH_SIZE,
+                    task=None, strategy="batch", max_items=TRANSLATE_BULK_MAX_ITEMS,
+                    max_chars=TRANSLATE_BULK_MAX_CHARS):
+    _ensure_llm()
+    _llm_inference_guard()
+    try:
+        return _translate_batch_impl(
+            text_list,
+            source_lang,
+            target_lang,
+            batch_size,
+            task,
+            strategy=strategy,
+            max_items=max_items,
+            max_chars=max_chars,
+        )
+    finally:
+        _llm_inference_done()
+
+def _translate_batch_impl(text_list, source_lang, target_lang, batch_size=TRANSLATE_BATCH_SIZE,
+                          task=None, strategy="batch", max_items=TRANSLATE_BULK_MAX_ITEMS,
+                          max_chars=TRANSLATE_BULK_MAX_CHARS):
+    """使用 LLM 批量翻译文本"""
+    src_name = LANGUAGE_NAMES_EN.get(source_lang, source_lang)
+    tgt_name = LANGUAGE_NAMES_EN.get(target_lang, target_lang)
+    batch_size = _normalize_translation_limit(batch_size, TRANSLATE_BATCH_SIZE, minimum=1, maximum=64)
+    max_items = _normalize_translation_limit(max_items, TRANSLATE_BULK_MAX_ITEMS, minimum=1, maximum=200)
+    max_chars = _normalize_translation_limit(max_chars, TRANSLATE_BULK_MAX_CHARS, minimum=200, maximum=20000)
+    strategy = "bulk" if strategy == "bulk" else "batch"
+
+    translations = []
+    total = len(text_list)
+    windows = _build_translation_windows(text_list, batch_size, strategy, max_items, max_chars)
+    total_batches = max(1, len(windows))
+    if task is not None:
+        task["translate_stats"] = {
+            "strategy": strategy,
+            "batch_size": batch_size,
+            "window_count": total_batches,
+            "max_items": max_items,
+            "max_chars": max_chars,
+        }
+
+    done_count = 0
+    for batch_idx, batch in enumerate(windows):
+
         try:
-            _req_data = {
-                "messages": [
-                    {"role": "system", "content": f"You are a professional subtitle translator. Translate {src_name} to {tgt_name}. Be concise and natural."},
-                    {"role": "user", "content": prompt}
-                ],
-                "stream": False,
-                "temperature": 0.3
-            }
-            _model = get_llm_model()
-            if _model:
-                _req_data["model"] = _model
-            result = post_json(LLM_URL, _req_data, api_key=get_llm_api_key())
-
-            response = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-            # 移除推理模型的 <think>...</think> 标签
-            response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
-            lines = response.strip().split('\n')
-
-            parsed = []
-            for line in lines:
-                line = line.strip()
-                line = re.sub(r'^\d+[\.\、\:\：\)）]?\s*', '', line)
-                if line:
-                    parsed.append(line)
-
-            for j in range(len(batch)):
-                if j < len(parsed):
-                    translations.append(parsed[j])
-                else:
-                    translations.append(f"[翻译失败] {batch[j]}")
+            translations.extend(_request_translation_batch(batch, src_name, tgt_name))
 
         except Exception as e:
             import traceback
@@ -1281,10 +1562,11 @@ def translate_batch(text_list, source_lang, target_lang, batch_size=8, task=None
             for t in batch:
                 translations.append(f"[翻译失败: {err_msg}] {t}")
 
+        done_count += len(batch)
         if task:
-            done = min(i + batch_size, total)
             pct = min(99, int((batch_idx + 1) / total_batches * 100))
-            task["progress"] = {"step": "translate", "percent": pct, "detail": f"翻译中 {done}/{total} 段"}
+            detail_prefix = "整批翻译" if strategy == "bulk" else "翻译中"
+            task["progress"] = {"step": "translate", "percent": pct, "detail": f"{detail_prefix} {done_count}/{total} 段"}
 
     return translations
 
@@ -1317,22 +1599,20 @@ async def root():
 @app.get("/api/check_services")
 async def check_services():
     whisper_ok = False
+    whisper_detail = ""
+    whisper_text = "检测中"
     llm_ok = False
-    vision_ok = False
+    llm_detail = ""
+    llm_text = "检测中"
 
-    try:
-        from faster_whisper import WhisperModel
-        whisper_ok = True
-    except Exception:
-        pass
+    whisper_status = _get_whisper_status_payload()
+    whisper_ok = whisper_status["ok"]
+    whisper_detail = whisper_status["detail"]
+    whisper_text = whisper_status["text"]
 
-    def _check_llm():
+    def _check_http_ok(url, api_key=""):
         try:
             import urllib.request
-            cfg = load_config()
-            api_base = cfg["llm"]["api_base"].rstrip("/")
-            api_key = cfg["llm"].get("api_key", "")
-            url = api_base + "/models"
             headers = {"Accept": "application/json"}
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
@@ -1342,11 +1622,35 @@ async def check_services():
         except Exception:
             return False
 
-    llm_ok = await asyncio.to_thread(_check_llm)
+    def _check_services():
+        cfg = load_config()
+        api_base = cfg["llm"]["api_base"].rstrip("/")
+        api_key = cfg["llm"].get("api_key", "")
 
-    # 视觉模型与 LLM 共用同一服务，只要 LLM 在线就表示可用
-    # （需要加载多模态模型才能实际使用视觉功能）
-    return {"whisper": whisper_ok, "llm": llm_ok, "vision": llm_ok}
+        if _is_external_api():
+            models_ok = _check_http_ok(api_base + "/models", api_key)
+            llm_ready = models_ok or bool(api_base and api_key)
+            llm_model_name = _display_model_name(cfg["llm"].get("model", ""), "服务默认模型")
+            llm_reason = f"{('external-models-ok' if models_ok else ('external-configured' if llm_ready else 'external-missing-config'))}; model={llm_model_name}; base={api_base or 'n/a'}"
+            llm_text = f"{('就绪' if llm_ready else '离线')} · {llm_model_name}"
+            return llm_ready, llm_reason, llm_text, False
+
+        mgr = get_llm_manager()
+        ok, reason, text, external_conflict = mgr.get_check_services_status()
+        return ok, reason, text, external_conflict
+
+    llm_ok, llm_detail, llm_text, external_conflict = await asyncio.to_thread(_check_services)
+
+    return {
+        "whisper": whisper_ok,
+        "whisper_detail": whisper_detail,
+        "whisper_text": whisper_text,
+        "llm": llm_ok,
+        "llm_detail": llm_detail,
+        "llm_text": llm_text,
+        "external_api": _is_external_api(),
+        "external_conflict": external_conflict,
+    }
 
 
 @app.get("/api/progress/{task_id}")
@@ -1396,14 +1700,7 @@ async def task_status(task_id: str):
     else:
         steps["subtitle"] = "pending"
 
-    if not task.get("enable_frames"):
-        steps["frames"] = "skip"
-    elif task.get("frame_descriptions") is not None:
-        steps["frames"] = "done"
-    elif task.get("progress", {}).get("step") == "frames":
-        steps["frames"] = "running"
-    else:
-        steps["frames"] = "pending"
+    steps["frames"] = "skip"
 
     return {
         "exists": True,
@@ -1425,8 +1722,6 @@ async def local_file(req: dict):
     source_lang = req.get("source_lang", "auto")
     target_lang = req.get("target_lang", "zh")
     mode = req.get("mode", "translate")
-    enable_frames = req.get("enable_frames", False)
-
     if not file_path:
         return {"error": "请输入文件路径"}
 
@@ -1462,7 +1757,7 @@ async def local_file(req: dict):
         "results": {},
         "created_at": time.time(),
         "is_local": True,
-        "enable_frames": enable_frames,
+        "enable_frames": False,
         "frame_descriptions": None,
         "video_summary": None,
         "progress": {"step": "", "percent": 0, "detail": ""},
@@ -1673,22 +1968,37 @@ def _split_audio_chunks(audio_path, chunk_dur=CHUNK_DURATION):
     return chunks
 
 
-def _run_transcribe(audio_path, source_lang, task=None):
-    """CPU 密集型 Whisper 转录 - 分块处理以控制内存"""
-    global _whisper_model
-    import gc
-
-    audio_duration = _get_audio_duration(audio_path)
-
-    # 全局单例，避免每次加载模型占用大量内存
-    if _whisper_model is None:
-        from faster_whisper import WhisperModel
+def _load_whisper_model(task=None):
+    summary = _get_whisper_runtime_summary()
+    backend = summary["backend"]
+    try:
+        model_path = summary["model_path"]
+        device = summary["device"]
+        compute_type = summary["compute_type"]
         if task:
             task["progress"] = {"step": "transcribe", "percent": 0, "detail": "加载模型中..."}
-        _model_path = get_whisper_model_path()
-        _device, _compute = get_whisper_device_config()
-        print(f"[Whisper] 加载模型: {_model_path}, device={_device}, compute={_compute}")
-        _whisper_model = WhisperModel(_model_path, device=_device, compute_type=_compute)
+        print(f"[Whisper] 加载模型: {model_path}, backend={backend}, device={device}, compute={compute_type}")
+        _append_runtime_log("Whisper", f"load backend=faster-whisper source={summary['model_source']} model={summary['model_name']} path={model_path} device={device} compute={compute_type}")
+        from faster_whisper import WhisperModel
+        return WhisperModel(model_path, device=device, compute_type=compute_type), (backend, model_path, device, compute_type)
+    except Exception as exc:
+        _append_runtime_exception("Whisper", f"load-failed backend={backend} model={summary['model_name']} path={summary['model_path']}", exc)
+        raise
+
+
+def _run_transcribe(audio_path, source_lang, task=None):
+    """CPU 密集型 Whisper 转录 - 分块处理以控制内存"""
+    global _whisper_model, _whisper_model_key
+    import gc
+
+    # 全局单例，避免每次加载模型占用大量内存
+    expected_backend = get_whisper_backend()
+    model_path = get_whisper_model_path()
+    device, compute_type = get_whisper_device_config()
+    expected_key = (expected_backend, model_path, device, compute_type)
+
+    if _whisper_model is None or _whisper_model_key != expected_key:
+        _whisper_model, _whisper_model_key = _load_whisper_model(task)
 
     # 拆分长音频为小块
     if task:
@@ -1710,12 +2020,16 @@ def _run_transcribe(audio_path, source_lang, task=None):
             task["progress"] = {"step": "transcribe", "percent": pct,
                                "detail": f"识别第 {ci+1}/{total_chunks} 块..."}
 
-        segments, info = _whisper_model.transcribe(
-            chunk_path,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
-            language=lang_param,
-        )
+        try:
+            segments, info = _whisper_model.transcribe(
+                chunk_path,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+                language=lang_param,
+            )
+        except Exception as exc:
+            _append_runtime_exception("Whisper", f"transcribe-failed chunk={ci+1}/{total_chunks} audio={chunk_path} backend={expected_backend}", exc)
+            raise
 
         if detected_info is None:
             detected_info = info
@@ -1792,7 +2106,8 @@ async def step_transcribe(task_id: str):
             pass
 
         lang_label = LANGUAGES.get(info.language, info.language)
-        return {"message": f"识别完成: {len(result)} 段, 语言: {lang_label} ({info.language_probability:.0%})"}
+        probability = getattr(info, "language_probability", 1.0)
+        return {"message": f"识别完成: {len(result)} 段, 语言: {lang_label} ({probability:.0%})"}
 
     except Exception as e:
         return {"error": f"语音识别失败: {str(e)}"}
@@ -1801,11 +2116,20 @@ async def step_transcribe(task_id: str):
 
 
 @app.post("/api/process/{task_id}/translate")
-async def step_translate(task_id: str):
+async def step_translate(task_id: str, request: Request):
     if task_id not in tasks:
         return {"error": "任务不存在"}
 
     task = tasks[task_id]
+    body = {}
+    try:
+        raw_body = await request.body()
+        if raw_body:
+            body = json.loads(raw_body.decode('utf-8'))
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "请求体不是合法 JSON"}, status_code=400)
+
+    strategy, batch_size, max_items, max_chars = _resolve_translation_request_options(body)
     if task["mode"] != "translate":
         task["translated_texts"] = None
         return {"message": "跳过翻译"}
@@ -1838,10 +2162,26 @@ async def step_translate(task_id: str):
     task["_proc_translate"] = True
     try:
         task["progress"] = {"step": "translate", "percent": 0, "detail": "翻译中..."}
-        translated = await asyncio.to_thread(translate_batch, source_texts, src_lang, tgt_lang, 8, task)
+        translated = await asyncio.to_thread(
+            translate_batch,
+            source_texts,
+            src_lang,
+            tgt_lang,
+            batch_size,
+            task,
+            strategy,
+            max_items,
+            max_chars,
+        )
         task["translated_texts"] = translated
         task["progress"] = {"step": "translate", "percent": 100, "detail": "翻译完成"}
-        return {"message": f"翻译完成: {len(translated)} 段"}
+        return {
+            "message": f"翻译完成: {len(translated)} 段",
+            "strategy": task.get("translate_stats", {}).get("strategy", strategy),
+            "window_count": task.get("translate_stats", {}).get("window_count", 0),
+            "max_items": task.get("translate_stats", {}).get("max_items", max_items),
+            "max_chars": task.get("translate_stats", {}).get("max_chars", max_chars),
+        }
     except Exception as e:
         return {"error": f"翻译失败: {str(e)}"}
     finally:
@@ -1855,8 +2195,9 @@ async def step_subtitle(task_id: str):
 
     task = tasks[task_id]
 
-    # 幂等：已完成直接返回
-    if task.get("results"):
+    existing_results = task.get("results", {})
+    existing_summary = existing_results.get("summary")
+    if existing_results and existing_summary and os.path.exists(existing_summary):
         video_path = Path(task["video_path"])
         return {"message": f"字幕已保存到: {video_path.parent}/"}
 
@@ -1879,6 +2220,7 @@ async def step_subtitle(task_id: str):
     stem = video_path.stem  # 视频文件名（不含扩展名）
 
     results = {}
+    task["progress"] = {"step": "subtitle", "percent": 10, "detail": "生成字幕文件..."}
 
     # 原文字幕
     src_name = f"{stem}_{src_lang}.srt"
@@ -1887,6 +2229,7 @@ async def step_subtitle(task_id: str):
     results["source"] = src_srt
 
     if mode == "translate" and translated_texts:
+        task["progress"] = {"step": "subtitle", "percent": 55, "detail": "写入译文和双语字幕..."}
         # 译文字幕
         tgt_name = f"{stem}_{tgt_lang}.srt"
         tgt_srt = os.path.join(out_dir, tgt_name)
@@ -1899,8 +2242,23 @@ async def step_subtitle(task_id: str):
         write_bilingual_srt(segments, source_texts, translated_texts, bi_srt)
         results["bilingual"] = bi_srt
 
+    task["progress"] = {"step": "subtitle", "percent": 85, "detail": "生成内容总结..."}
+    summary = await asyncio.to_thread(
+        _generate_summary,
+        source_texts,
+        translated_texts if mode == "translate" else None,
+    )
+    summary_path = os.path.join(out_dir, f"{stem}_summary.md")
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        f.write("# 视频内容总结\n\n")
+        f.write(summary)
+        f.write("\n")
+    results["summary"] = summary_path
+    task["video_summary"] = summary
+
     task["results"] = results
-    return {"message": f"字幕已保存到: {out_dir}/"}
+    task["progress"] = {"step": "subtitle", "percent": 100, "detail": "字幕与总结已生成"}
+    return {"message": f"字幕与总结已保存到: {out_dir}/"}
 
 
 @app.get("/api/results/{task_id}")
@@ -1941,211 +2299,62 @@ async def preview(task_id: str, key: str):
     return "".join(lines)
 
 
-# ========== 视频帧分析 ==========
+MOVIE_SUMMARY_RULES = """你是影视内容分析助手，负责仅基于字幕内容总结电影或电视剧片段。
 
-def _extract_frames(video_path, task_id, interval=FRAME_INTERVAL, task=None):
-    """用 FFmpeg 按固定间隔提取关键帧 (逐帧 seek 方式，避免全量解码超时)"""
-    frame_dir = os.path.join(FRAME_DIR, task_id)
-    os.makedirs(frame_dir, exist_ok=True)
+请严格遵守以下规则：
+1. 只依据输入中的字幕内容进行总结，不补充演员背景、完整剧情、作品设定或外部常识。
+2. 优先提炼当前片段中可直接确认的信息，无法确认的身份、关系、动机、时间线和因果，不要擅自推断。
+3. 总结要聚焦人物对话、旁白、信息披露、情绪表达和冲突推进，不要简单重复原句。
+4. 重点总结与剧情推进有关的事件、人物关系变化、目标冲突和情绪转折，弱化无关细节。
+5. 不要输出“可能是”“应该是”这类空泛猜测；证据不足时明确写“当前字幕中无法确认”。
+6. 输出必须使用中文 Markdown，并严格按以下结构组织：
+## 整体概述
+用 2-3 句话概括片段主题、主要场景和核心矛盾。
 
-    if task:
-        task["progress"] = {"step": "frames", "percent": 0, "detail": "获取视频时长..."}
+## 关键信息
+- 2-4 条，概括人物说了什么、透露了什么信息、情绪或立场如何。
 
-    # 获取视频时长
-    duration = _get_duration(video_path)
-    if duration <= 0:
-        raise RuntimeError("无法获取视频时长")
+## 人物与关系
+- 2-4 条，概括当前字幕中能确认的人物关系、立场对立或协作状态。
 
-    # 计算需要提取的时间点
-    timestamps = []
-    t = 0
-    while t < duration:
-        timestamps.append(t)
-        t += interval
+## 情节推进与看点
+- 2-4 条，概括该片段推动了什么剧情、建立了什么悬念或冲突。
 
-    if task:
-        task["progress"] = {"step": "frames", "percent": 0, "detail": f"提取 {len(timestamps)} 帧..."}
-
-    # 逐帧 seek 提取，每帧独立超时 30s
-    frames = []
-    for idx, ts in enumerate(timestamps):
-        out_path = os.path.join(frame_dir, f"frame_{idx+1:04d}.jpg")
-        cmd = [
-            FFMPEG, "-y", "-ss", str(ts), "-i", video_path,
-            "-vf", "scale=512:-2",
-            "-frames:v", "1", "-q:v", "3",
-            out_path,
-        ]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if proc.returncode == 0 and os.path.exists(out_path):
-                frames.append({
-                    "idx": idx,
-                    "time": ts,
-                    "time_str": f"{int(ts // 60)}:{int(ts % 60):02d}",
-                    "path": out_path,
-                })
-        except subprocess.TimeoutExpired:
-            pass  # 跳过超时的帧，继续下一帧
-
-        if task:
-            pct = int((idx + 1) / len(timestamps) * 5)
-            task["progress"] = {"step": "frames", "percent": pct, "detail": f"提取帧 {idx+1}/{len(timestamps)}"}
-
-    if task:
-        task["progress"] = {"step": "frames", "percent": 5, "detail": f"已提取 {len(frames)} 帧"}
-
-    return frames
+整体保持简洁、客观、可核对，总字数控制在 350-600 字。"""
 
 
-def _analyze_frame(image_path):
-    """将单帧发送给视觉模型获取描述"""
-    import base64
-    _ensure_llm(MODE_VISION)
-
-    with open(image_path, "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode()
-
-    data = {
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                {"type": "text", "text": "用中文简要描述这个视频画面中的内容，包括场景、人物、动作等关键信息。控制在2-3句话以内。"},
-            ]
-        }],
-        "max_tokens": 200,
-        "temperature": 0.3,
-    }
-    _model = get_llm_model()
-    if _model:
-        data["model"] = _model
-
+def _generate_summary(source_texts, translated_texts=None, task=None):
+    """仅基于字幕内容生成视频总结。"""
+    _ensure_llm()
+    _llm_inference_guard()
     try:
-        result = post_json(VISION_URL, data, api_key=get_llm_api_key())
-        content = result["choices"][0]["message"]["content"]
-        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
-        return content
-    except Exception as e:
-        return f"[分析失败: {str(e)[:100]}]"
+        primary_lines = translated_texts or source_texts or []
+        primary_context = "\n".join(primary_lines[:120])
+        original_context = "\n".join((source_texts or [])[:120])
+        if not primary_context:
+            return "[总结生成失败: 缺少可用字幕内容]"
 
+        prompt = f"""{MOVIE_SUMMARY_RULES}
 
-def _make_frame_grid(frame_paths, cols=3, rows=2):
-    """将多帧拼成 rows×cols 网格图，返回临时文件路径"""
-    from PIL import Image
+以下是待总结的影视片段字幕素材，请仅依据字幕内容生成总结。
 
-    cell_w, cell_h = 341, 256  # 每格尺寸，网格总尺寸 ~1023×512
-    grid_w, grid_h = cell_w * cols, cell_h * rows
-    grid = Image.new("RGB", (grid_w, grid_h), (0, 0, 0))
+优先使用的字幕内容：
+{primary_context[:4000]}
 
-    for i, path in enumerate(frame_paths):
-        if i >= cols * rows:
-            break
-        r, c = divmod(i, cols)
-        img = Image.open(path)
-        img = img.resize((cell_w, cell_h), Image.LANCZOS)
-        grid.paste(img, (c * cell_w, r * cell_h))
+原始字幕参考：
+{original_context[:3000]}
 
-    import tempfile
-    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-    grid.save(tmp.name, "JPEG", quality=85)
-    tmp.close()
-    return tmp.name
+请开始总结。"""
 
+        data = {
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 800,
+            "temperature": 0.5,
+        }
 
-def _analyze_frame_grid(grid_path, frame_infos):
-    """将网格图发送给视觉模型，一次分析多帧，返回描述列表"""
-    import base64, re
-    _ensure_llm(MODE_VISION)
-
-    with open(grid_path, "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode()
-
-    n = len(frame_infos)
-    time_labels = ", ".join(
-        f"【{i+1}】{fi['time_str']}" for i, fi in enumerate(frame_infos)
-    )
-
-    prompt = (
-        f"这是一张2行×3列的视频截图网格（共{n}帧），从左到右、从上到下依次为：{time_labels}。\n"
-        f"请逐一描述每帧画面内容（场景、人物、动作），每帧2-3句话。\n"
-        f"严格按以下格式输出：\n"
-        + "\n".join(f"【{i+1}】描述内容" for i in range(n))
-    )
-
-    data = {
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                {"type": "text", "text": prompt},
-            ]
-        }],
-        "max_tokens": 150 * n,
-        "temperature": 0.3,
-    }
-
-    _model = get_llm_model()
-    if _model:
-        data["model"] = _model
-
-    result = post_json(VISION_URL, data, api_key=get_llm_api_key())
-    text = result["choices"][0]["message"]["content"]
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-
-    # 按【N】分割解析
-    descriptions = []
-    for i in range(n):
-        pattern = f"【{i+1}】"
-        next_pattern = f"【{i+2}】" if i + 1 < n else None
-        start = text.find(pattern)
-        if start == -1:
-            descriptions.append("")
-            continue
-        start += len(pattern)
-        end = text.find(next_pattern, start) if next_pattern else len(text)
-        if end == -1:
-            end = len(text)
-        descriptions.append(text[start:end].strip())
-
-    return descriptions
-
-
-def _generate_summary(frame_descriptions, source_texts, task=None):
-    """综合帧描述和字幕生成视频内容总结"""
-    _ensure_llm(MODE_TEXT)
-    frame_context = "\n".join(
-        f"[{fd['time_str']}] {fd.get('description', '')}"
-        for fd in frame_descriptions if fd.get('description')
-    )
-
-    subtitle_context = ""
-    if source_texts:
-        subtitle_context = "\n".join(source_texts[:100])
-
-    prompt = f"""根据以下视频画面描述和语音转录内容，生成一份简洁的视频内容总结。
-
-画面描述时间线：
-{frame_context[:3000]}
-
-语音转录摘要：
-{subtitle_context[:3000]}
-
-请用中文生成 300-500 字的视频内容总结，包括：
-1. 视频主题和类型
-2. 主要内容概述
-3. 关键场景描述"""
-
-    data = {
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 800,
-        "temperature": 0.5,
-    }
-
-    _model = get_llm_model()
-    if _model:
-        data["model"] = _model
-    try:
+        _model = get_llm_model()
+        if _model:
+            data["model"] = _model
         result = post_json(LLM_URL, data, api_key=get_llm_api_key())
         content = result["choices"][0]["message"]["content"]
         # 移除推理模型的 <think>...</think> 标签
@@ -2153,6 +2362,8 @@ def _generate_summary(frame_descriptions, source_texts, task=None):
         return content
     except Exception as e:
         return f"[总结生成失败: {str(e)[:200]}]"
+    finally:
+        _llm_inference_done()
 
 
 @app.post("/api/process/{task_id}/frames")
@@ -2161,95 +2372,9 @@ async def step_frames(task_id: str):
         return {"error": "任务不存在"}
 
     task = tasks[task_id]
-
-    # 幂等: 已完成直接返回
-    if task.get("frame_descriptions") is not None:
-        return {"message": f"帧分析已完成: {len(task['frame_descriptions'])} 帧"}
-    # 正在处理: 等待完成
-    if task.get("_proc_frames"):
-        while task.get("_proc_frames"):
-            await asyncio.sleep(0.5)
-        if task.get("frame_descriptions") is not None:
-            return {"message": f"帧分析已完成: {len(task['frame_descriptions'])} 帧"}
-        return {"error": "帧分析失败"}
-
-    task["_proc_frames"] = True
-    try:
-        # 1. 提取帧
-        task["progress"] = {"step": "frames", "percent": 0, "detail": "提取关键帧..."}
-        frames = await asyncio.to_thread(
-            _extract_frames, task["video_path"], task_id, FRAME_INTERVAL, task
-        )
-
-        if not frames:
-            task["frame_descriptions"] = []
-            task["video_summary"] = ""
-            return {"message": "未提取到关键帧"}
-
-        # 2. 网格批量分析（每6帧一批，fallback 逐帧）
-        total = len(frames)
-        batch_size = 6
-        batches = [frames[i:i+batch_size] for i in range(0, total, batch_size)]
-        analyzed = 0
-
-        for batch_idx, batch in enumerate(batches):
-            pct = 5 + int((analyzed / total) * 80)
-            task["progress"] = {"step": "frames", "percent": pct,
-                               "detail": f"分析第 {analyzed+1}-{analyzed+len(batch)}/{total} 帧 (网格模式)"}
-            try:
-                grid_path = await asyncio.to_thread(
-                    _make_frame_grid, [f["path"] for f in batch]
-                )
-                descriptions = await asyncio.to_thread(
-                    _analyze_frame_grid, grid_path, batch
-                )
-                # 清理临时网格文件
-                try:
-                    os.unlink(grid_path)
-                except OSError:
-                    pass
-                # 校验数量匹配
-                if len(descriptions) == len(batch) and any(d for d in descriptions):
-                    for frame, desc in zip(batch, descriptions):
-                        frame["description"] = desc if desc else "[网格分析未返回描述]"
-                else:
-                    raise ValueError("网格描述数量不匹配或全空，退化为逐帧")
-            except Exception:
-                # Fallback: 逐帧分析
-                for i, frame in enumerate(batch):
-                    task["progress"] = {"step": "frames", "percent": pct,
-                                       "detail": f"分析第 {analyzed+i+1}/{total} 帧 (逐帧模式)"}
-                    desc = await asyncio.to_thread(_analyze_frame, frame["path"])
-                    frame["description"] = desc
-            analyzed += len(batch)
-
-        task["frame_descriptions"] = frames
-
-        # 3. 生成内容总结
-        task["progress"] = {"step": "frames", "percent": 90, "detail": "生成内容总结..."}
-        summary = await asyncio.to_thread(
-            _generate_summary, frames, task.get("source_texts", [])
-        )
-        task["video_summary"] = summary
-
-        # 4. 保存总结到 Markdown 文件
-        video_path = Path(task["video_path"])
-        summary_path = os.path.join(str(video_path.parent), f"{video_path.stem}_summary.md")
-        with open(summary_path, 'w', encoding='utf-8') as f:
-            f.write(f"# 视频内容总结\n\n{summary}\n\n")
-            f.write(f"---\n\n## 画面描述时间线\n\n")
-            for frame in frames:
-                desc = frame.get('description', '')
-                f.write(f"### ⏱ {frame['time_str']}\n\n{desc}\n\n")
-        task["results"]["summary"] = summary_path
-
-        task["progress"] = {"step": "frames", "percent": 100, "detail": f"完成: {total} 帧分析"}
-        return {"message": f"帧分析完成: {total} 帧, 已生成内容总结"}
-
-    except Exception as e:
-        return {"error": f"帧分析失败: {str(e)[:200]}"}
-    finally:
-        task["_proc_frames"] = False
+    task["frame_descriptions"] = []
+    task["video_summary"] = task.get("video_summary") or ""
+    return {"message": "视频帧分析功能已移除，当前版本仅基于字幕生成总结"}
 
 
 @app.get("/api/frames/{task_id}")
@@ -2258,27 +2383,13 @@ async def get_frames(task_id: str):
     if task_id not in tasks:
         return {"frames": [], "summary": ""}
     task = tasks[task_id]
-    frames = task.get("frame_descriptions") or []
-    # 返回不含本地路径的帧信息
-    safe_frames = [
-        {"idx": f["idx"], "time": f["time"], "time_str": f["time_str"],
-         "description": f.get("description", "")}
-        for f in frames
-    ]
-    return {"frames": safe_frames, "summary": task.get("video_summary", "")}
+    return {"frames": [], "summary": task.get("video_summary", "")}
 
 
 @app.get("/api/frame_image/{task_id}/{idx}")
 async def serve_frame(task_id: str, idx: int):
     """提供帧图片"""
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    frames = tasks[task_id].get("frame_descriptions") or []
-    for f in frames:
-        if f["idx"] == idx:
-            if os.path.exists(f["path"]):
-                return FileResponse(f["path"], media_type="image/jpeg")
-    raise HTTPException(status_code=404, detail="帧图片不存在")
+    raise HTTPException(status_code=404, detail="当前版本已移除视频帧图片功能")
 
 
 # ────────────────── Settings API ──────────────────
@@ -2289,21 +2400,68 @@ async def get_settings():
     return load_config()
 
 
+@app.get("/api/model_options")
+async def get_model_options():
+    cfg = load_config()
+    return {
+        "current": cfg,
+        "whisper": _discover_whisper_model_options(),
+        "llm": {
+            "local": _discover_local_model_options(),
+        },
+    }
+
+
+@app.get("/api/runtime_log")
+async def get_runtime_log(lines: int = 200):
+    lines = max(20, min(lines, 1000))
+    if not _RUNTIME_LOG_FILE.exists():
+        return PlainTextResponse("日志文件尚未生成\n路径: /tmp/llm-logs/video_subtitle.log\n")
+    from collections import deque
+    with _RUNTIME_LOG_FILE.open('r', encoding='utf-8', errors='replace') as f:
+        tail_lines = deque(f, maxlen=lines)
+    return PlainTextResponse(''.join(tail_lines) or '暂无日志\n')
+
+
 @app.post("/api/settings")
 async def update_settings(request: Request):
     """更新配置（安全合并，只更新已知字段）"""
-    global LLM_URL, VISION_URL, FRAME_INTERVAL
+    global LLM_URL, FRAME_INTERVAL
     body = await request.json()
     config = load_config()
-    for section in ["llm", "vision", "whisper", "app"]:
+    original = json.loads(json.dumps(config, ensure_ascii=False))
+    for section in ["llm", "whisper", "app"]:
         if section in body:
             for key, value in body[section].items():
                 if key in config.get(section, {}):
                     config[section][key] = value
+    config["whisper"]["backend"] = "faster-whisper"
+    config["whisper"].pop("mlx_model", None)
     save_config(config)
+
+    llm_changed = any(original["llm"].get(key) != config["llm"].get(key) for key in ["api_base", "chat_path", "model", "model_path"])
+    whisper_changed = any(original["whisper"].get(key) != config["whisper"].get(key) for key in ["model_path", "device", "compute_type"])
+
+    _append_runtime_log(
+        "Config",
+        "save "
+        f"whisper_backend=faster-whisper "
+        f"whisper_model={config['whisper'].get('model_path')} "
+        f"llm_model={config['llm'].get('model') or 'default'} "
+        f"llm_model_path={config['llm'].get('model_path') or 'default'}"
+    )
+
+    if whisper_changed:
+        _reset_whisper_runtime("settings-updated")
+
+    if llm_changed:
+        mgr = get_llm_manager()
+        if mgr.is_running:
+            mgr.stop()
+        _append_runtime_log("LLM", f"config-updated llm_changed={llm_changed}; service_stopped_for_reload")
+
     # 热更新运行时变量
     LLM_URL = build_llm_url(config)
-    VISION_URL = get_vision_url(config)
     FRAME_INTERVAL = config["app"].get("frame_interval", 60)
     return {"message": "设置已保存", "config": config}
 
@@ -2322,20 +2480,28 @@ async def llm_status():
 
 
 @app.post("/api/llm_start")
-async def llm_start(request: Request):
-    """手动启动 LLM 服务"""
-    body = await request.json()
-    mode = body.get("mode", "text")
+async def llm_start():
+    """预热本地 LLM 服务（异步启动）"""
+    if _is_external_api():
+        return JSONResponse({"success": False, "error": "外部 API 模式无需预热"}, status_code=400)
     mgr = get_llm_manager()
-    ok = mgr.start(mode)
-    return {"success": ok, "status": mgr.get_status()}
+    conflict = mgr.detect_external_conflict()
+    if conflict:
+        return JSONResponse({"success": False, "error": "端口被外部进程占用", "external_conflict": True}, status_code=409)
+    import threading
+    threading.Thread(target=mgr.start, daemon=True).start()
+    return JSONResponse({"success": True, "message": "正在预热"}, status_code=202)
 
 
 @app.post("/api/llm_stop")
 async def llm_stop():
-    """停止 LLM 服务"""
+    """释放本地 LLM 服务"""
+    if _is_external_api():
+        return JSONResponse({"success": False, "error": "外部 API 模式无需释放"}, status_code=400)
     mgr = get_llm_manager()
-    mgr.stop()
+    stopped = mgr.stop()
+    if stopped is False:
+        return JSONResponse({"success": False, "error": "进程非本应用所有，无法停止", "external_conflict": True}, status_code=409)
     return {"success": True}
 
 
@@ -2372,11 +2538,22 @@ if __name__ == "__main__":
 
     @app.on_event("startup")
     async def _auto_start_llm():
+        whisper_summary = _get_whisper_runtime_summary()
+        whisper_parts = [
+            f"backend={whisper_summary['backend']}",
+            f"source={whisper_summary['model_source']}",
+            f"model={whisper_summary['model_name']}",
+            f"path={whisper_summary['model_path']}",
+            f"device={whisper_summary['device']}",
+            f"compute={whisper_summary['compute_type']}",
+        ]
+        _append_runtime_log("Whisper", "startup " + " ".join(whisper_parts))
+
+        # 不再自动启动 LLM，由推理请求按需触发
         if _llm_mgr._get_text_model_path():
-            print("[LLM] 正在启动文本模型...")
-            _llm_mgr.start(MODE_TEXT, wait=False)
+            print("[LLM] 模型就绪，等待推理请求时按需启动")
         else:
-            print("[LLM] 未找到文本模型，跳过自动启动")
+            print("[LLM] 未找到文本模型")
 
     def _cleanup():
         print("[LLM] 正在停止...")

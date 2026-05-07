@@ -173,34 +173,7 @@ start_vision_llm() {
 
 start_media_web() {
     echo "Starting Media Assistant Web UI (port 8090)..."
-
-    pkill -f "video_subtitle_app.py" 2>/dev/null || true
-    sleep 1
-
-    mkdir -p "$LOG_DIR"
-    # 使用 start_new_session=True 完全脱离终端，防止 SIGTTOU 挂起
-    "$PROJECT_DIR/02-media-assistant/.venv/bin/python" -c "
-import subprocess, os, sys
-with open('$LOG_DIR/media.log', 'w') as log:
-    subprocess.Popen(
-        [sys.executable, 'video_subtitle_app.py'],
-        cwd='$PROJECT_DIR/02-media-assistant',
-        stdout=log, stderr=log,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True
-    )
-"
-
-    for i in {1..15}; do
-        curl -sf http://127.0.0.1:8090/ >/dev/null 2>&1 && break
-        sleep 1
-    done
-
-    if curl -sf http://127.0.0.1:8090/ >/dev/null 2>&1; then
-        echo "  Media Assistant started at http://0.0.0.0:8090"
-    else
-        echo "  ERROR: Media Assistant failed. Check $LOG_DIR/media.log"
-    fi
+    MEDIA_ASSISTANT_PORT=8090 "$PROJECT_DIR/02-media-assistant/service.sh" start
 }
 
 start_ollama() {
@@ -226,7 +199,7 @@ stop_services() {
     pkill -f "web_app.py" 2>/dev/null || true
     echo "  Web UI stopped"
 
-    pkill -f "video_subtitle_app.py" 2>/dev/null || true
+    MEDIA_ASSISTANT_PORT=8090 "$PROJECT_DIR/02-media-assistant/service.sh" stop >/dev/null 2>&1 || true
     echo "  Media Assistant stopped"
 
     docker stop qdrant 2>/dev/null || true

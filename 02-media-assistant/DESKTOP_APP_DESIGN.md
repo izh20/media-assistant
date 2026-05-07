@@ -15,7 +15,7 @@
 | 后端 | Python 3.11 + FastAPI | PyInstaller 冻结为单文件可执行 |
 | 语音识别 | faster-whisper (large-v3-turbo) | 预置模型，GPU 自适应 |
 | 翻译/总结 | MiniMax API (OpenAI 兼容) | 用户配置 API Key |
-| 视觉分析 | 本地 llama-server + Qwen2-VL | 首发要求用户本地自配服务 |
+| 内容总结 | 本地 llama-server + Qwen2.5-7B | 基于字幕文本进行总结 |
 | 音视频处理 | ffmpeg/ffprobe 静态编译版 | 捆绑在应用内 |
 | 自动更新 | electron-updater + GitHub Releases | Windows 应用内自动更新，macOS 检测更新并跳转下载 |
 | 打包 | electron-builder | 输出 DMG (macOS) + NSIS (Windows) |
@@ -45,7 +45,7 @@
 ├──────────────────────────────────────────────────────────────┤
 │  External Services (用户自配)                                  │
 │  ├── LLM (翻译/总结): MiniMax API 或其他 OpenAI 兼容服务      │
-│  └── Vision (帧分析): 本地 llama-server + Qwen2-VL            │
+│  └── Summary (字幕总结): 本地 llama-server + Qwen2.5-7B       │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -77,15 +77,15 @@ Speed: ~100 TPS
 
 也支持任何 OpenAI 兼容 API（本地 llama-server、DeepSeek、OpenAI 等）。
 
-### Vision 视觉服务 (本地)
+### 本地总结服务
 
 ```
-Service: llama-server (用户自行启动)
-Model: Qwen2-VL-7B-Instruct-Q4_K_M.gguf + mmproj
+Service: llama-server
+Model: Qwen2.5-7B-Instruct GGUF
 Endpoint URL: http://127.0.0.1:8080/v1/chat/completions
 ```
 
-应用内提供启动引导，检测 llama-server 是否在线。Vision 功能在服务不可用时自动禁用。
+应用内检测 llama-server 是否在线；当外部 API 已配置时，也可以直接走外部兼容接口完成翻译与总结。
 
 ### Windows GPU 前置条件
 
@@ -114,10 +114,6 @@ Endpoint URL: http://127.0.0.1:8080/v1/chat/completions
     "api_key": "",
     "model": "MiniMax-M2.7-highspeed",
     "timeout": 60
-  },
-  "vision": {
-    "endpoint_url": "http://127.0.0.1:8080/v1/chat/completions",
-    "timeout": 180
   },
   "whisper": {
     "model_path": "bundled",

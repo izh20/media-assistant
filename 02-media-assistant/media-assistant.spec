@@ -1,5 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files
+
+
+tiktoken_datas = []
+
+try:
+    tiktoken_datas = collect_data_files('tiktoken')
+except Exception:
+    pass
+
 
 a = Analysis(
     ['video_subtitle_app.py'],
@@ -9,8 +19,8 @@ a = Analysis(
         ('config.py', '.'),
         ('llm_manager.py', '.'),
         ('.venv/lib/python3.11/site-packages/faster_whisper/assets', 'faster_whisper/assets'),
-    ],
-    hiddenimports=['faster_whisper', 'ctranslate2', 'uvicorn', 'uvicorn.logging', 'uvicorn.loops.auto', 'uvicorn.protocols.http.auto', 'uvicorn.protocols.websockets.auto', 'uvicorn.lifespan.on', 'fastapi', 'starlette.routing', 'starlette.responses', 'starlette.middleware.cors', 'pydantic', 'pydantic_core', 'anyio._backends._asyncio', 'sniffio', 'PIL.Image', 'python_multipart', 'h11'],
+    ] + tiktoken_datas,
+    hiddenimports=['faster_whisper', 'ctranslate2', 'uvicorn', 'uvicorn.logging', 'uvicorn.loops.auto', 'uvicorn.protocols.http.auto', 'uvicorn.protocols.websockets.auto', 'uvicorn.lifespan.on', 'fastapi', 'starlette.routing', 'starlette.responses', 'starlette.middleware.cors', 'pydantic', 'pydantic_core', 'anyio._backends._asyncio', 'sniffio', 'PIL.Image', 'python_multipart', 'h11', 'tiktoken_ext.openai_public'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
